@@ -4,7 +4,7 @@ variables:
   DEBFULLNAME: Alexandre Frade
   DEBEMAIL: kernel@xanmod.org
   KDEB_CHANGELOG_DIST: bookworm
-  KCONFIG_CONFIG: CONFIGS/x86_64/config
+  KCONFIG_CONFIG: CONFIGS/x86_64/config-rt
   LLVM: 1
   jv: $((2*$(nproc)))
   gv: $(git rev-parse --short=7 HEAD)
@@ -16,12 +16,12 @@ variables:
 before_script:
   - wget -O - https://dl.xanmod.org/${CI_ASSETS} | tar xvJ
   - echo $jobs
-  - scripts/config --file $KCONFIG_CONFIG --set-str LOCALVERSION -x64v$isa --set-val X86_64_VERSION $isa
+  - scripts/config --file $KCONFIG_CONFIG --set-str LOCALVERSION -rt-x64v$isa --set-val X86_64_VERSION $isa
   - pvcmd="cat $KCONFIG_CONFIG | grep 'LOCALVERSION='" && export pv=$(eval $pvcmd | cut -d'"' -f2)
   - export mvcmd="make -j$jv KDEB_PKGVERSION=$lv$pv$xv-$rv~$dv.g"$gv" bindeb-pkg 2>&1 | tee ../build-$lv$pv$xv-$rv~$dv.g"$gv"_amd64.log && xz -e9 ../build-*$pv*"
   - export avcmd="mkdir -p assets/ && mv ../*$pv* assets/"
 
-6.18 x64v2:
+6.18-rt x64v2:
   tags: [saas-linux-xlarge-amd64]
   stage: build
   only:
@@ -40,7 +40,7 @@ before_script:
     - assets/*dbg*
   timeout: 2h
 
-6.18 x64v3:
+6.18-rt x64v3:
   tags: [saas-linux-xlarge-amd64]
   stage: build
   only:
