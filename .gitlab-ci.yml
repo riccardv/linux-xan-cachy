@@ -1,9 +1,8 @@
-image: $CI_REGISTRY_IMAGE/xanmod-toolchain:latest
+image: $CI_REGISTRY_IMAGE/xanmod-toolchain:trixie
 
 variables:
   DEBFULLNAME: Alexandre Frade
   DEBEMAIL: kernel@xanmod.org
-  KDEB_CHANGELOG_DIST: bookworm
   KCONFIG_CONFIG: CONFIGS/x86_64/config-rt
   LLVM: 1
   jv: $((2*$(nproc)))
