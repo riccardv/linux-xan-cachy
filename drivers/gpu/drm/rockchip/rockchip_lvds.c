@@ -119,7 +119,7 @@ static const
 struct drm_bridge_funcs rockchip_lvds_bridge_funcs = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.get_modes = rockchip_lvds_bridge_get_modes,
 };
 
@@ -626,12 +626,6 @@ static int rockchip_lvds_bind(struct device *dev, struct device *master,
 				"failed to initialize bridge connector: %pe\n",
 				connector);
 			ret = PTR_ERR(connector);
-			goto err_free_bridge;
-		}
-
-		ret = drm_connector_attach_encoder(connector, encoder);
-		if (ret < 0) {
-			drm_err(drm_dev, "failed to attach encoder: %d\n", ret);
 			goto err_free_bridge;
 		}
 	}

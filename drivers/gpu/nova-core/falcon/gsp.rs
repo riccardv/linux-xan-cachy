@@ -40,7 +40,7 @@ impl FalconEngine for Gsp {}
 impl Falcon<Gsp> {
     /// Clears the SWGEN0 bit in the Falcon's IRQ status clear register to
     /// allow GSP to signal CPU for processing new messages in message queue.
-    pub(crate) fn clear_swgen0_intr(&self, bar: &Bar0) {
+    pub(crate) fn clear_swgen0_intr(&self, bar: Bar0<'_>) {
         bar.write(
             WithBase::of::<Gsp>(),
             regs::NV_PFALCON_FALCON_IRQSCLR::zeroed().with_swgen0(true),
@@ -48,7 +48,7 @@ impl Falcon<Gsp> {
     }
 
     /// Checks if GSP reload/resume has completed during the boot process.
-    pub(crate) fn check_reload_completed(&self, bar: &Bar0, timeout: Delta) -> Result<bool> {
+    pub(crate) fn check_reload_completed(&self, bar: Bar0<'_>, timeout: Delta) -> Result<bool> {
         read_poll_timeout(
             || Ok(bar.read(regs::NV_PGC6_BSI_SECURE_SCRATCH_14)),
             |val| val.boot_stage_3_handoff(),
@@ -56,5 +56,25 @@ impl Falcon<Gsp> {
             timeout,
         )
         .map(|_| true)
+    }
+
+    /// Returns whether the RISC-V branch privilege lockdown bit is set.
+    pub(crate) fn riscv_branch_privilege_lockdown(&self, bar: Bar0<'_>) -> bool {
+        bar.read(regs::NV_PFALCON_FALCON_HWCFG2::of::<Gsp>())
+            .riscv_br_priv_lockdown()
+    }
+
+    /// Returns whether GSP registers can be read by the CPU.
+    pub(crate) fn priv_target_mask_released(&self, bar: Bar0<'_>) -> bool {
+        /// Pattern returned by GSP register reads while the PRIV target mask still blocks CPU
+        /// access. The low byte varies; the upper 24 bits are fixed.
+        const LOCKED_PATTERN: u32 = 0xbadf_4100;
+        const LOCKED_MASK: u32 = 0xffff_ff00;
+
+        let hwcfg2 = bar
+            .read(regs::NV_PFALCON_FALCON_HWCFG2::of::<Gsp>())
+            .into_raw();
+
+        hwcfg2 != 0 && (hwcfg2 & LOCKED_MASK) != LOCKED_PATTERN
     }
 }

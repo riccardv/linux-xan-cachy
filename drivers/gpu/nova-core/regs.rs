@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 use kernel::{
     io::{
@@ -7,6 +8,7 @@ use kernel::{
         Io, //
     },
     prelude::*,
+    sizes::SizeConstants,
     time, //
 };
 
@@ -30,7 +32,6 @@ use crate::{
         Architecture,
         Chipset, //
     },
-    num::FromSafeCast,
 };
 
 // PMC
@@ -125,7 +126,7 @@ register! {
     }
 
     /// High bits of the physical system memory address used by the GPU to perform sysmembar
-    /// operations (see [`crate::fb::SysmemFlush`]).
+    /// operations.
     pub(crate) NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI(u32) @ 0x00100c40 {
         23:0    adr_63_40;
     }
@@ -147,11 +148,70 @@ register! {
     }
 }
 
+/// Base of the GB10x HSHUB0 register window (`NV_HSHUB0_PRIV_BASE` in Open RM).
+///
+/// The base is provided by the GB10x framebuffer HAL.
+pub(crate) struct Hshub0Base(());
+
+register! {
+    // GB10x sysmem flush registers, relative to the HSHUB0 base. GB10x routes sysmembar
+    // through a primary and an EG (egress) pair that must both be programmed to the same
+    // address. Hardware ignores bits 7:0 of each LO register. The boot path uses a fixed
+    // HSHUB0 base, so the multiple runtime-discovered HSHUB bases are not needed here.
+    pub(crate) NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_LO(u32) @ Hshub0Base + 0x00000e50 {
+        31:0    adr => u32;
+    }
+
+    pub(crate) NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI(u32) @ Hshub0Base + 0x00000e54 {
+        19:0    adr;
+    }
+
+    pub(crate) NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_LO(u32) @ Hshub0Base + 0x000006c0 {
+        31:0    adr => u32;
+    }
+
+    pub(crate) NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_HI(u32) @ Hshub0Base + 0x000006c4 {
+        19:0    adr;
+    }
+}
+
+register! {
+    // GB20x FBHUB0 sysmem flush registers. Unlike the older
+    // NV_PFB_NISO_FLUSH_SYSMEM_ADDR registers, which encode the address with an
+    // 8-bit right-shift, these take the raw address split into lower and upper
+    // halves. Hardware ignores bits 7:0 of the LO register.
+    pub(crate) NV_PFB_FBHUB0_PCIE_FLUSH_SYSMEM_ADDR_LO(u32) @ 0x008a1d58 {
+        31:0    adr => u32;
+    }
+
+    pub(crate) NV_PFB_FBHUB0_PCIE_FLUSH_SYSMEM_ADDR_HI(u32) @ 0x008a1d5c {
+        19:0    adr;
+    }
+}
+
+register! {
+    /// Low bits of the physical system memory address used by the GPU to perform
+    /// sysmembar operations on Hopper.
+    ///
+    /// Like the GB20x FBHUB0 registers, and unlike the Ampere
+    /// `NV_PFB_NISO_FLUSH_SYSMEM_ADDR` registers (which encode the address with an
+    /// 8-bit right-shift), these take the raw address split into lower and upper
+    /// halves. Hardware ignores bits 7:0 of the LO register.
+    pub(crate) NV_PFB_FBHUB_PCIE_FLUSH_SYSMEM_ADDR_LO(u32) @ 0x00100a34 {
+        31:0    adr => u32;
+    }
+
+    /// High bits of the physical system memory address used by the GPU to perform
+    /// sysmembar operations on Hopper.
+    pub(crate) NV_PFB_FBHUB_PCIE_FLUSH_SYSMEM_ADDR_HI(u32) @ 0x00100a38 {
+        19:0    adr;
+    }
+}
+
 impl NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE {
     /// Returns the usable framebuffer size, in bytes.
     pub(crate) fn usable_fb_size(self) -> u64 {
-        let size = (u64::from(self.lower_mag()) << u64::from(self.lower_scale()))
-            * u64::from_safe_cast(kernel::sizes::SZ_1M);
+        let size = (u64::from(self.lower_mag()) << u64::from(self.lower_scale())) * u64::SZ_1M;
 
         if self.ecc_mode_enabled() {
             // Remove the amount of memory reserved for ECC (one per 16 units).
@@ -176,13 +236,10 @@ impl NV_PFB_PRI_MMU_WPR2_ADDR_HI {
     pub(crate) fn higher_bound(self) -> u64 {
         u64::from(self.hi_val()) << 12
     }
-}
 
-// PGSP
-
-register! {
-    pub(crate) NV_PGSP_QUEUE_HEAD(u32) @ 0x00110c00 {
-        31:0    address;
+    /// Returns whether the WPR2 region is currently set.
+    pub(crate) fn is_wpr2_set(self) -> bool {
+        self.hi_val() != 0
     }
 }
 
@@ -241,29 +298,7 @@ impl NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT {
 impl NV_USABLE_FB_SIZE_IN_MB {
     /// Returns the usable framebuffer size, in bytes.
     pub(crate) fn usable_fb_size(self) -> u64 {
-        u64::from(self.value()) * u64::from_safe_cast(kernel::sizes::SZ_1M)
-    }
-}
-
-// PDISP
-
-register! {
-    pub(crate) NV_PDISP_VGA_WORKSPACE_BASE(u32) @ 0x00625f04 {
-        /// VGA workspace base address divided by 0x10000.
-        31:8    addr;
-        /// Set if the `addr` field is valid.
-        3:3     status_valid => bool;
-    }
-}
-
-impl NV_PDISP_VGA_WORKSPACE_BASE {
-    /// Returns the base address of the VGA workspace, or `None` if none exists.
-    pub(crate) fn vga_workspace_addr(self) -> Option<u64> {
-        if self.status_valid() {
-            Some(u64::from(self.addr()) << 16)
-        } else {
-            None
-        }
+        u64::from(self.value()) * u64::SZ_1M
     }
 }
 
@@ -314,6 +349,8 @@ register! {
     pub(crate) NV_PFALCON_FALCON_HWCFG2(u32) @ PFalconBase + 0x000000f4 {
         /// Signal indicating that reset is completed (GA102+).
         31:31   reset_ready => bool;
+        /// RISC-V branch privilege lockdown bit.
+        13:13   riscv_br_priv_lockdown => bool;
         /// Set to 0 after memory scrubbing is completed.
         12:12   mem_scrubbing => bool;
         10:10   riscv => bool;
@@ -426,6 +463,24 @@ register! {
     pub(crate) NV_PFALCON_FBIF_CTL(u32) @ PFalconBase + 0x00000624 {
         7:7     allow_phys_no_ctx => bool;
     }
+
+    // Falcon EMEM PIO registers (used by FSP on Hopper/Blackwell).
+    // These provide the falcon external memory communication interface.
+
+    pub(crate) NV_PFALCON_FALCON_EMEMC(u32) @ PFalconBase + 0x00000ac0 {
+        /// EMEM byte offset (4-byte aligned) within the block.
+        7:2     offs;
+        /// EMEM block to access.
+        15:8    blk;
+        /// Auto-increment the offset after each write.
+        24:24   aincw => bool;
+        /// Auto-increment the offset after each read.
+        25:25   aincr => bool;
+    }
+
+    pub(crate) NV_PFALCON_FALCON_EMEMD(u32) @ PFalconBase + 0x00000ac4 {
+        31:0    data => u32;
+    }
 }
 
 impl NV_PFALCON_FALCON_DMACTL {
@@ -449,7 +504,7 @@ impl NV_PFALCON_FALCON_DMATRFCMD {
 
 impl NV_PFALCON_FALCON_ENGINE {
     /// Resets the falcon
-    pub(crate) fn reset_engine<E: FalconEngine>(bar: &Bar0) {
+    pub(crate) fn reset_engine<E: FalconEngine>(bar: Bar0<'_>) {
         bar.update(Self::of::<E>(), |r| r.with_reset(true));
 
         // TIMEOUT: falcon engine should not take more than 10us to reset.
@@ -512,6 +567,27 @@ register! {
     }
 }
 
+// FSP (Foundation Security Processor) queue registers for Hopper/Blackwell Chain of Trust.
+// These registers manage falcon EMEM communication queues.
+
+register! {
+    pub(crate) NV_PFSP_QUEUE_HEAD(u32)[8] @ 0x008f2c00 {
+        31:0    address => u32;
+    }
+
+    pub(crate) NV_PFSP_QUEUE_TAIL(u32)[8] @ 0x008f2c04 {
+        31:0    address => u32;
+    }
+
+    pub(crate) NV_PFSP_MSGQ_HEAD(u32)[8] @ 0x008f2c80 {
+        31:0    val => u32;
+    }
+
+    pub(crate) NV_PFSP_MSGQ_TAIL(u32)[8] @ 0x008f2c84 {
+        31:0    val => u32;
+    }
+}
+
 // The modules below provide registers that are not identical on all supported chips. They should
 // only be used in HAL modules.
 
@@ -535,6 +611,42 @@ pub(crate) mod ga100 {
     register! {
         pub(crate) NV_FUSE_STATUS_OPT_DISPLAY(u32) @ 0x00820c04 {
             0:0     display_disabled => bool;
+        }
+    }
+}
+
+pub(crate) const NV_THERM_I2CS_SCRATCH_FSP_BOOT_COMPLETE_STATUS_SUCCESS: u32 = 0xff;
+
+pub(crate) mod gh100 {
+    use kernel::io::register;
+
+    // PTHERM
+
+    register! {
+        pub(crate) NV_THERM_I2CS_SCRATCH(u32) @ 0x000200bc {
+            31:0    data;
+        }
+
+        // Alias to `NV_THERM_I2CS_SCRATCH` when used to check for FSP boot completion.
+        pub(crate) NV_THERM_I2CS_SCRATCH_FSP_BOOT_COMPLETE(u32) => NV_THERM_I2CS_SCRATCH {
+            31:0    fsp_boot_complete;
+        }
+    }
+}
+
+pub(crate) mod gb202 {
+    use kernel::io::register;
+
+    // PTHERM
+
+    register! {
+        pub(crate) NV_THERM_I2CS_SCRATCH(u32) @ 0x00ad00bc {
+            31:0    data;
+        }
+
+        // Alias to `NV_THERM_I2CS_SCRATCH` when used to check for FSP boot completion.
+        pub(crate) NV_THERM_I2CS_SCRATCH_FSP_BOOT_COMPLETE(u32) => NV_THERM_I2CS_SCRATCH {
+            31:0    fsp_boot_complete;
         }
     }
 }

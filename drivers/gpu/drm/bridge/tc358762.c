@@ -150,7 +150,7 @@ static int tc358762_init(struct tc358762 *ctx)
 }
 
 static void tc358762_post_disable(struct drm_bridge *bridge,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct tc358762 *ctx = bridge_to_tc358762(bridge);
 	int ret;
@@ -173,7 +173,7 @@ static void tc358762_post_disable(struct drm_bridge *bridge,
 }
 
 static void tc358762_pre_enable(struct drm_bridge *bridge,
-				struct drm_atomic_state *state)
+				struct drm_atomic_commit *state)
 {
 	struct tc358762 *ctx = bridge_to_tc358762(bridge);
 	int ret;
@@ -191,7 +191,7 @@ static void tc358762_pre_enable(struct drm_bridge *bridge,
 }
 
 static void tc358762_enable(struct drm_bridge *bridge,
-			    struct drm_atomic_state *state)
+			    struct drm_atomic_commit *state)
 {
 	struct tc358762 *ctx = bridge_to_tc358762(bridge);
 	int ret;
@@ -226,7 +226,7 @@ static const struct drm_bridge_funcs tc358762_bridge_funcs = {
 	.atomic_enable = tc358762_enable,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.attach = tc358762_attach,
 	.mode_set = tc358762_bridge_mode_set,
 };

@@ -7,7 +7,6 @@
 //! be loaded using PIO.
 
 use kernel::{
-    alloc::KVec,
     device::{
         self,
         Device, //
@@ -280,7 +279,7 @@ impl FwsecFirmwareWithBl {
         &self,
         dev: &Device<device::Bound>,
         falcon: &Falcon<Gsp>,
-        bar: &Bar0,
+        bar: Bar0<'_>,
     ) -> Result<()> {
         // Reset falcon, load the firmware, and run it.
         falcon

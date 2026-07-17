@@ -12,24 +12,41 @@
 use crate::{
     container_of,
     drm::{
-        device,
         driver,
         gem,
-        private::Sealed, //
+        private::Sealed,
+        Device,
+        DeviceContext,
+        Registered, //
     },
     error::to_result,
+    io::{
+        Io,
+        IoCapable,
+        IoKnownSize, //
+    },
     prelude::*,
     sync::aref::ARef,
-    types::Opaque, //
+    types::{
+        NotThreadSafe,
+        Opaque, //
+    },
 };
 use core::{
+    ffi::c_void,
+    marker::PhantomData,
+    mem::MaybeUninit, //
     ops::{
         Deref,
         DerefMut, //
     },
-    ptr::NonNull,
+    ptr::{
+        self,
+        NonNull, //
+    },
 };
 use gem::{
+    BaseObject,
     BaseObjectPrivate,
     DriverObject,
     IntoGEMObject, //
@@ -39,43 +56,59 @@ use gem::{
 ///
 /// This is used with [`Object::new()`] to control various properties that can only be set when
 /// initially creating a shmem-backed GEM object.
-#[derive(Default)]
-pub struct ObjectConfig<'a, T: DriverObject> {
+pub struct ObjectConfig<'a, T: DriverObject, C: DeviceContext = Registered> {
     /// Whether to set the write-combine map flag.
     pub map_wc: bool,
 
     /// Reuse the DMA reservation from another GEM object.
     ///
     /// The newly created [`Object`] will hold an owned refcount to `parent_resv_obj` if specified.
-    pub parent_resv_obj: Option<&'a Object<T>>,
+    pub parent_resv_obj: Option<&'a Object<T, C>>,
+}
+
+impl<'a, T: DriverObject, C: DeviceContext> Default for ObjectConfig<'a, T, C> {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            map_wc: false,
+            parent_resv_obj: None,
+        }
+    }
 }
 
 /// A shmem-backed GEM object.
 ///
 /// # Invariants
 ///
-/// `obj` contains a valid initialized `struct drm_gem_shmem_object` for the lifetime of this
-/// object.
+/// - `obj` contains a valid initialized `struct drm_gem_shmem_object` for the lifetime of this
+///   object.
+/// - Any type invariants of `C` apply to the parent DRM device for this GEM object.
 #[repr(C)]
 #[pin_data]
-pub struct Object<T: DriverObject> {
+pub struct Object<T: DriverObject, C: DeviceContext = Registered> {
     #[pin]
     obj: Opaque<bindings::drm_gem_shmem_object>,
     /// Parent object that owns this object's DMA reservation object.
-    parent_resv_obj: Option<ARef<Object<T>>>,
+    parent_resv_obj: Option<ARef<Object<T, C>>>,
     #[pin]
     inner: T,
+    _ctx: PhantomData<C>,
 }
 
-super::impl_aref_for_gem_obj!(impl<T> for Object<T> where T: DriverObject);
+super::impl_aref_for_gem_obj! {
+    impl<T, C> for Object<T, C>
+    where
+        T: DriverObject,
+        C: DeviceContext
+}
 
 // SAFETY: All GEM objects are thread-safe.
-unsafe impl<T: DriverObject> Send for Object<T> {}
+unsafe impl<T: DriverObject, C: DeviceContext> Send for Object<T, C> {}
 
 // SAFETY: All GEM objects are thread-safe.
-unsafe impl<T: DriverObject> Sync for Object<T> {}
+unsafe impl<T: DriverObject, C: DeviceContext> Sync for Object<T, C> {}
 
-impl<T: DriverObject> Object<T> {
+impl<T: DriverObject, C: DeviceContext> Object<T, C> {
     /// `drm_gem_object_funcs` vtable suitable for GEM shmem objects.
     const VTABLE: bindings::drm_gem_object_funcs = bindings::drm_gem_object_funcs {
         free: Some(Self::free_callback),
@@ -106,9 +139,9 @@ impl<T: DriverObject> Object<T> {
     ///
     /// Additional config options can be specified using `config`.
     pub fn new(
-        dev: &device::Device<T::Driver>,
+        dev: &Device<T::Driver, C>,
         size: usize,
-        config: ObjectConfig<'_, T>,
+        config: ObjectConfig<'_, T, C>,
         args: T::Args,
     ) -> Result<ARef<Self>> {
         let new: Pin<KBox<Self>> = KBox::try_pin_init(
@@ -116,6 +149,7 @@ impl<T: DriverObject> Object<T> {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
                 inner <- T::new(dev, size, args),
+                _ctx: PhantomData::<C>,
             }),
             GFP_KERNEL,
         )?;
@@ -148,9 +182,9 @@ impl<T: DriverObject> Object<T> {
     }
 
     /// Returns the `Device` that owns this GEM object.
-    pub fn dev(&self) -> &device::Device<T::Driver> {
+    pub fn dev(&self) -> &Device<T::Driver, C> {
         // SAFETY: `dev` will have been initialized in `Self::new()` by `drm_gem_shmem_init()`.
-        unsafe { device::Device::from_raw((*self.as_raw()).dev) }
+        unsafe { Device::from_raw((*self.as_raw()).dev) }
     }
 
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
@@ -168,15 +202,88 @@ impl<T: DriverObject> Object<T> {
         // SAFETY:
         // - We verified above that `obj` is valid, which makes `this` valid
         // - This function is set in AllocOps, so we know that `this` is contained within a
-        //   `Object<T>`
+        //   `Object<T, C>`
         let this = unsafe { container_of!(Opaque::cast_from(this), Self, obj) }.cast_mut();
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(this) };
     }
+
+    /// Attempt to create a vmap from the gem object, and confirm the size of said vmap.
+    fn make_vmap<'a, R, const SIZE: usize>(&'a self) -> Result<VMap<T, R, C, SIZE>>
+    where
+        R: Deref<Target = Self> + From<&'a Self>,
+    {
+        // INVARIANT: We check here that the gem object is at least as large as `SIZE`.
+        if self.size() < SIZE {
+            return Err(ENOSPC);
+        }
+
+        let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
+        let guard = DmaResvGuard::new(self);
+
+        // SAFETY: `drm_gem_shmem_vmap()` can be called with the DMA reservation lock held.
+        to_result(unsafe {
+            bindings::drm_gem_shmem_vmap_locked(self.as_raw_shmem(), map.as_mut_ptr())
+        })?;
+
+        // Drop the guard explicitly here, since we may need to call `raw_vunmap()` (which
+        // re-acquires the lock).
+        drop(guard);
+
+        // SAFETY: The call to `drm_gem_shmem_vmap_locked()` succeeded above, so we are guaranteed
+        // that map is properly initialized.
+        let map = unsafe { map.assume_init() };
+
+        // XXX: We don't currently support iomem allocations
+        if map.is_iomem {
+            // SAFETY: The vmap operation above succeeded, guaranteeing that `map` points to a valid
+            // memory mapping.
+            unsafe { self.raw_vunmap(map) };
+
+            Err(ENOTSUPP)
+        } else {
+            Ok(VMap {
+                // INVARIANT: `addr` remains valid for as long as `owner` does, which extends to the
+                // lifetime of `VMap` itself.
+                // SAFETY: We checked that this is not an iomem allocation, making it safe to read
+                // vaddr.
+                addr: unsafe { map.__bindgen_anon_1.vaddr },
+                owner: self.into(),
+            })
+        }
+    }
+
+    /// Unmap a vmap from the gem object.
+    ///
+    /// # Safety
+    ///
+    /// - The caller promises that `map` is a valid vmap on this gem object.
+    /// - The caller promises that the memory pointed to by map will no longer be accesed through
+    ///   this instance.
+    unsafe fn raw_vunmap(&self, mut map: bindings::iosys_map) {
+        let _guard = DmaResvGuard::new(self);
+
+        // SAFETY:
+        // - This function is safe to call with the DMA reservation lock held.
+        // - The caller promises that `map` is a valid vmap on this gem object.
+        unsafe { bindings::drm_gem_shmem_vunmap_locked(self.as_raw_shmem(), &mut map) };
+    }
+
+    /// Creates and returns a virtual kernel memory mapping for this object.
+    #[inline]
+    pub fn vmap<const SIZE: usize>(&self) -> Result<VMapRef<'_, T, C, SIZE>> {
+        self.make_vmap()
+    }
+
+    /// Creates and returns an owned reference to a virtual kernel memory mapping for this object.
+    #[inline]
+    pub fn owned_vmap<const SIZE: usize>(&self) -> Result<VMapOwned<T, C, SIZE>> {
+        self.make_vmap()
+    }
 }
 
-impl<T: DriverObject> Deref for Object<T> {
+impl<T: DriverObject, C: DeviceContext> Deref for Object<T, C> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -184,15 +291,15 @@ impl<T: DriverObject> Deref for Object<T> {
     }
 }
 
-impl<T: DriverObject> DerefMut for Object<T> {
+impl<T: DriverObject, C: DeviceContext> DerefMut for Object<T, C> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl<T: DriverObject> Sealed for Object<T> {}
+impl<T: DriverObject, C: DeviceContext> Sealed for Object<T, C> {}
 
-impl<T: DriverObject> gem::IntoGEMObject for Object<T> {
+impl<T: DriverObject, C: DeviceContext> gem::IntoGEMObject for Object<T, C> {
     fn as_raw(&self) -> *mut bindings::drm_gem_object {
         // SAFETY:
         // - Our immutable reference is proof that this is safe to dereference.
@@ -200,18 +307,18 @@ impl<T: DriverObject> gem::IntoGEMObject for Object<T> {
         unsafe { &raw mut (*self.obj.get()).base }
     }
 
-    unsafe fn from_raw<'a>(obj: *mut bindings::drm_gem_object) -> &'a Object<T> {
+    unsafe fn from_raw<'a>(obj: *mut bindings::drm_gem_object) -> &'a Self {
         // SAFETY: The safety contract of from_gem_obj() guarantees that `obj` is contained within
         // `Self`
         unsafe {
             let obj = Opaque::cast_from(container_of!(obj, bindings::drm_gem_shmem_object, base));
 
-            &*container_of!(obj, Object<T>, obj)
+            &*container_of!(obj, Self, obj)
         }
     }
 }
 
-impl<T: DriverObject> driver::AllocImpl for Object<T> {
+impl<T: DriverObject, C: DeviceContext> driver::AllocImpl for Object<T, C> {
     type Driver = T::Driver;
 
     const ALLOC_OPS: driver::AllocOps = driver::AllocOps {
@@ -223,4 +330,288 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
         dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
         dumb_map_offset: None,
     };
+}
+
+/// Private helper-type for holding the `dma_resv` object for a GEM shmem object.
+///
+/// When this is dropped, the `dma_resv` lock is dropped as well.
+///
+// TODO: This should be replace with a WwMutex equivalent once we have such bindings in the kernel.
+struct DmaResvGuard<'a, T: DriverObject, C: DeviceContext = Registered>(
+    &'a Object<T, C>,
+    NotThreadSafe,
+);
+
+impl<'a, T: DriverObject, C: DeviceContext> DmaResvGuard<'a, T, C> {
+    #[inline]
+    fn new(obj: &'a Object<T, C>) -> Self {
+        // SAFETY: This lock is initialized throughout the lifetime of `object`.
+        unsafe { bindings::dma_resv_lock(obj.raw_dma_resv(), ptr::null_mut()) };
+
+        Self(obj, NotThreadSafe)
+    }
+}
+
+impl<'a, T: DriverObject, C: DeviceContext> Drop for DmaResvGuard<'a, T, C> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: We are releasing the lock grabbed during the creation of this object.
+        unsafe { bindings::dma_resv_unlock(self.0.raw_dma_resv()) };
+    }
+}
+
+/// A reference to a virtual mapping for an shmem-based GEM object in kernel address space.
+///
+/// # Invariants
+///
+/// - The size of `owner` is >= SIZE.
+/// - The memory pointed to by `addr` remains valid at least until this object is dropped.
+pub struct VMap<D, R, C = Registered, const SIZE: usize = 0>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>>,
+{
+    addr: *mut c_void,
+    owner: R,
+}
+
+/// An alias type for a reference to a shmem-based GEM object's VMap.
+pub type VMapRef<'a, D, C, const SIZE: usize = 0> = VMap<D, &'a Object<D, C>, C, SIZE>;
+
+/// An alias type for an owned reference to a shmem-based GEM object's VMap.
+pub type VMapOwned<D, C, const SIZE: usize = 0> = VMap<D, ARef<Object<D, C>>, C, SIZE>;
+
+impl<D, R, C, const SIZE: usize> VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>>,
+{
+    /// Borrows a reference to the object that owns this virtual mapping.
+    #[inline]
+    pub fn owner(&self) -> &Object<D, C> {
+        &self.owner
+    }
+}
+
+impl<D, R, C, const SIZE: usize> Drop for VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>>,
+{
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY:
+        // - Our existence is proof that this map was previously created using self.owner.
+        // - Since we are in Drop, we are guaranteed that no one will access the memory
+        //   through this mapping after calling this.
+        unsafe {
+            self.owner.raw_vunmap(bindings::iosys_map {
+                is_iomem: false,
+                __bindgen_anon_1: bindings::iosys_map__bindgen_ty_1 { vaddr: self.addr },
+            })
+        };
+    }
+}
+
+// SAFETY: `addr` points to a valid memory address for as long as `owner` exists, meaning that so
+// long as `owner` is `Send` so is `VMap`.
+unsafe impl<D, R, C, const SIZE: usize> Send for VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>> + Send,
+{
+}
+
+// SAFETY: `addr` points to a valid memory address for as long as `owner` exists, meaning that so
+// long as `owner` is `Sync` so is `VMap`.
+unsafe impl<D, R, C, const SIZE: usize> Sync for VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>> + Sync,
+{
+}
+
+impl<D, R, C, const SIZE: usize> Io for VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>>,
+{
+    #[inline]
+    fn addr(&self) -> usize {
+        self.addr as usize
+    }
+
+    #[inline]
+    fn maxsize(&self) -> usize {
+        self.owner.size()
+    }
+}
+
+impl<D, R, C, const SIZE: usize> IoKnownSize for VMap<D, R, C, SIZE>
+where
+    D: DriverObject,
+    C: DeviceContext,
+    R: Deref<Target = Object<D, C>>,
+{
+    const MIN_SIZE: usize = SIZE;
+}
+
+macro_rules! impl_vmap_io_capable {
+    ($ty:ty) => {
+        impl<D, R, C, const SIZE: usize> IoCapable<$ty> for VMap<D, R, C, SIZE>
+        where
+            D: DriverObject,
+            C: DeviceContext,
+            R: Deref<Target = Object<D, C>>,
+        {
+            #[inline]
+            unsafe fn io_read(&self, address: usize) -> $ty {
+                let ptr = address as *mut $ty;
+
+                // SAFETY: The safety contract of `io_read` guarantees that address is a valid
+                // address within the bounds of `Self` of at least the size of $ty, and is properly
+                // aligned.
+                unsafe { ptr::read_volatile(ptr) }
+            }
+
+            #[inline]
+            unsafe fn io_write(&self, value: $ty, address: usize) {
+                let ptr = address as *mut $ty;
+
+                // SAFETY: The safety contract of `io_write` guarantees that address is a valid
+                // address within the bounds of `Self` of at least the size of $ty, and is properly
+                // aligned.
+                unsafe { ptr::write_volatile(ptr, value) }
+            }
+        }
+    };
+}
+
+impl_vmap_io_capable!(u8);
+impl_vmap_io_capable!(u16);
+impl_vmap_io_capable!(u32);
+#[cfg(CONFIG_64BIT)]
+impl_vmap_io_capable!(u64);
+
+#[kunit_tests(rust_drm_gem_shmem)]
+mod tests {
+    use super::*;
+    use crate::{
+        drm::{
+            self,
+            UnregisteredDevice, //
+        },
+        faux,
+        page::PAGE_SIZE, //
+    };
+
+    // The bare minimum needed to create a fake drm driver for kunit
+
+    #[pin_data]
+    struct KunitData {}
+    struct KunitDriver;
+    struct KunitFile;
+    #[pin_data]
+    struct KunitObject {}
+
+    const INFO: drm::DriverInfo = drm::DriverInfo {
+        major: 0,
+        minor: 0,
+        patchlevel: 0,
+        name: c"kunit",
+        desc: c"Kunit",
+    };
+
+    impl drm::file::DriverFile for KunitFile {
+        type Driver = KunitDriver;
+
+        fn open(_dev: &drm::Device<KunitDriver>) -> Result<Pin<KBox<Self>>> {
+            Ok(KBox::new(Self, GFP_KERNEL)?.into())
+        }
+    }
+
+    impl gem::DriverObject for KunitObject {
+        type Driver = KunitDriver;
+        type Args = ();
+
+        fn new<C: DeviceContext>(
+            _dev: &drm::Device<KunitDriver, C>,
+            _size: usize,
+            _args: Self::Args,
+        ) -> impl PinInit<Self, Error> {
+            try_pin_init!(KunitObject {})
+        }
+    }
+
+    #[vtable]
+    impl drm::Driver for KunitDriver {
+        type Data = KunitData;
+        type File = KunitFile;
+        type Object<Ctx: DeviceContext> = Object<KunitObject, Ctx>;
+
+        const INFO: drm::DriverInfo = INFO;
+        const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
+    }
+
+    fn create_drm_dev() -> Result<(faux::Registration, UnregisteredDevice<KunitDriver>)> {
+        // Create a faux DRM device so we can test gem object creation.
+        let data = try_pin_init!(KunitData {});
+        let dev = faux::Registration::new(c"Kunit", None)?;
+        let drm = UnregisteredDevice::new(dev.as_ref(), data)?;
+
+        Ok((dev, drm))
+    }
+
+    #[test]
+    fn compile_time_vmap_sizes() -> Result {
+        let (_dev, drm) = create_drm_dev()?;
+
+        let obj = Object::<KunitObject, _>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+
+        // Try creating a normal vmap
+        obj.vmap::<PAGE_SIZE>()?;
+
+        // Try creating a vmap that's smaller then the size we specified
+        let vmap = obj.vmap::<{ PAGE_SIZE - 100 }>()?;
+
+        // Verify the owner matches
+        assert!(ptr::eq(vmap.owner(), obj.deref()));
+
+        // Verify the max size matches the actual object size
+        assert_eq!(vmap.maxsize(), PAGE_SIZE);
+
+        // Make sure creating a vmap that's too large fails
+        assert!(obj.vmap::<{ PAGE_SIZE + 200 }>().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn vmap_io() -> Result {
+        let (_dev, drm) = create_drm_dev()?;
+
+        let obj = Object::<KunitObject, _>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+
+        let vmap = obj.vmap::<PAGE_SIZE>()?;
+
+        vmap.write8(0xDE, 0x0);
+        assert_eq!(vmap.read8(0x0), 0xDE);
+        vmap.write32(0xFEDCBA98, 0x20);
+
+        assert_eq!(vmap.read32(0x20), 0xFEDCBA98);
+
+        // Ensure the ordering in memory is correct
+        let expected = 0xFEDCBA98_u32.to_ne_bytes().into_iter();
+        for (offset, expected) in (0x20..=0x23).zip(expected) {
+            assert_eq!(vmap.read8(offset), expected);
+        }
+
+        Ok(())
+    }
 }

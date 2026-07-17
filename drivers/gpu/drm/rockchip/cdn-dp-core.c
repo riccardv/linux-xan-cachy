@@ -563,7 +563,7 @@ static void cdn_dp_display_info_update(struct cdn_dp_device *dp,
 	}
 }
 
-static void cdn_dp_bridge_atomic_enable(struct drm_bridge *bridge, struct drm_atomic_state *state)
+static void cdn_dp_bridge_atomic_enable(struct drm_bridge *bridge, struct drm_atomic_commit *state)
 {
 	struct cdn_dp_device *dp = bridge_to_dp(bridge);
 	struct drm_connector *connector;
@@ -630,7 +630,7 @@ out:
 	mutex_unlock(&dp->lock);
 }
 
-static void cdn_dp_bridge_atomic_disable(struct drm_bridge *bridge, struct drm_atomic_state *state)
+static void cdn_dp_bridge_atomic_disable(struct drm_bridge *bridge, struct drm_atomic_commit *state)
 {
 	struct cdn_dp_device *dp = bridge_to_dp(bridge);
 	int ret;
@@ -825,7 +825,7 @@ out:
 static const struct drm_bridge_funcs cdn_dp_bridge_funcs = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.detect = cdn_dp_bridge_detect,
 	.edid_read = cdn_dp_bridge_edid_read,
 	.atomic_enable = cdn_dp_bridge_atomic_enable,
@@ -1023,8 +1023,6 @@ static int cdn_dp_bind(struct device *dev, struct device *master, void *data)
 		dev_err(dp->dev, "failed to init bridge connector: %d\n", ret);
 		return ret;
 	}
-
-	drm_connector_attach_encoder(connector, encoder);
 
 	for (i = 0; i < dp->ports; i++) {
 		port = dp->port[i];

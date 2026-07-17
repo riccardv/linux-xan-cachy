@@ -313,7 +313,7 @@ static void rk3066_hdmi_config_phy(struct rk3066_hdmi *hdmi)
 }
 
 static int rk3066_hdmi_setup(struct rk3066_hdmi *hdmi,
-			     struct drm_atomic_state *state)
+			     struct drm_atomic_commit *state)
 {
 	struct drm_bridge *bridge = &hdmi->bridge;
 	struct drm_connector *connector;
@@ -394,7 +394,7 @@ static int rk3066_hdmi_setup(struct rk3066_hdmi *hdmi,
 }
 
 static void rk3066_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct rk3066_hdmi *hdmi = bridge_to_rk3066_hdmi(bridge);
 	struct drm_connector_state *conn_state;
@@ -424,7 +424,7 @@ static void rk3066_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
 }
 
 static void rk3066_hdmi_bridge_atomic_disable(struct drm_bridge *bridge,
-					      struct drm_atomic_state *state)
+					      struct drm_atomic_commit *state)
 {
 	struct rk3066_hdmi *hdmi = bridge_to_rk3066_hdmi(bridge);
 
@@ -497,7 +497,7 @@ rk3066_hdmi_bridge_mode_valid(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs rk3066_hdmi_bridge_funcs = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.atomic_enable = rk3066_hdmi_bridge_atomic_enable,
 	.atomic_disable = rk3066_hdmi_bridge_atomic_disable,
 	.detect = rk3066_hdmi_bridge_detect,
@@ -730,8 +730,6 @@ rk3066_hdmi_register(struct drm_device *drm, struct rk3066_hdmi *hdmi)
 		dev_err(hdmi->dev, "failed to init bridge connector: %d\n", ret);
 		return ret;
 	}
-
-	drm_connector_attach_encoder(hdmi->connector, encoder);
 
 	return 0;
 }

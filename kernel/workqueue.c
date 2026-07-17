@@ -509,10 +509,10 @@ static DEFINE_IDR(worker_pool_idr);	/* PR: idr of all pools */
 static DEFINE_HASHTABLE(unbound_pool_hash, UNBOUND_POOL_HASH_ORDER);
 
 /* I: attributes used when instantiating standard unbound pools on demand */
-static struct workqueue_attrs *unbound_std_wq_attrs[NR_STD_WORKER_POOLS];
+static struct workqueue_attrs *unbound_std_wq_attrs[NR_STD_WORKER_POOLS + 1];
 
 /* I: attributes used when instantiating ordered pools on demand */
-static struct workqueue_attrs *ordered_wq_attrs[NR_STD_WORKER_POOLS];
+static struct workqueue_attrs *ordered_wq_attrs[NR_STD_WORKER_POOLS + 1];
 
 /*
  * I: kthread_worker to release pwq's. pwq release needs to be bounced to a
@@ -545,6 +545,8 @@ struct workqueue_struct *system_bh_highpri_wq;
 EXPORT_SYMBOL_GPL(system_bh_highpri_wq);
 struct workqueue_struct *system_dfl_long_wq __ro_after_init;
 EXPORT_SYMBOL_GPL(system_dfl_long_wq);
+
+static atomic_t total_rtpri_workers = ATOMIC_INIT(0);
 
 static int worker_thread(void *__worker);
 static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
@@ -1236,9 +1238,7 @@ static bool assign_work(struct work_struct *work, struct worker *worker,
 
 static struct irq_work *bh_pool_irq_work(struct worker_pool *pool)
 {
-	int high = pool->attrs->nice == HIGHPRI_NICE_LEVEL ? 1 : 0;
-
-	return &per_cpu(bh_pool_irq_works, pool->cpu)[high];
+	return &per_cpu(bh_pool_irq_works, pool->cpu)[pool->attrs->prio];
 }
 
 static void kick_bh_pool(struct worker_pool *pool)
@@ -1251,7 +1251,7 @@ static void kick_bh_pool(struct worker_pool *pool)
 		return;
 	}
 #endif
-	if (pool->attrs->nice == HIGHPRI_NICE_LEVEL)
+	if (pool->attrs->prio >= WQ_PRIO_HIGH)
 		raise_softirq_irqoff(HI_SOFTIRQ);
 	else
 		raise_softirq_irqoff(TASKLET_SOFTIRQ);
@@ -2801,13 +2801,16 @@ static int format_worker_id(char *buf, size_t size, struct worker *worker,
 				 worker->rescue_wq->name);
 
 	if (pool) {
-		if (pool->cpu >= 0)
+		if (pool->cpu >= 0) {
+			const char *suffix[NUM_WQ_PRIO] = { "", "H", "R" };
+
 			return scnprintf(buf, size, "kworker/%d:%d%s",
 					 pool->cpu, worker->id,
-					 pool->attrs->nice < 0  ? "H" : "");
-		else
+					 suffix[pool->attrs->prio]);
+		} else {
 			return scnprintf(buf, size, "kworker/u%d:%d",
 					 pool->id, worker->id);
+		}
 	} else {
 		return scnprintf(buf, size, "kworker/dying");
 	}
@@ -2830,12 +2833,30 @@ static struct worker *create_worker(struct worker_pool *pool)
 	struct worker *worker;
 	int id;
 
+	/*
+	 * Do not consume all CPUs with RT workers to avoid scheduler
+	 * starvation.
+	 */
+	if (pool->attrs->prio == WQ_PRIO_RT) {
+		unsigned int max = num_online_cpus();
+
+		if (max > 2)
+			max = max - 1;
+		else
+			max = 1;
+
+		if (atomic_inc_return(&total_rtpri_workers) > max) {
+			atomic_dec(&total_rtpri_workers);
+			return NULL;
+		}
+	}
+
 	/* ID is needed to determine kthread name */
 	id = ida_alloc(&pool->worker_ida, GFP_KERNEL);
 	if (id < 0) {
 		pr_err_once("workqueue: Failed to allocate a worker ID: %pe\n",
 			    ERR_PTR(id));
-		return NULL;
+		goto fail_ida;
 	}
 
 	worker = alloc_worker(pool->node);
@@ -2863,7 +2884,11 @@ static struct worker *create_worker(struct worker_pool *pool)
 			goto fail;
 		}
 
-		set_user_nice(worker->task, pool->attrs->nice);
+		if (pool->attrs->prio == WQ_PRIO_RT)
+			sched_set_fifo_low(worker->task);
+		else
+			set_user_nice(worker->task, pool->attrs->nice);
+
 		kthread_bind_mask(worker->task, pool_allowed_cpus(pool));
 	}
 
@@ -2888,6 +2913,9 @@ static struct worker *create_worker(struct worker_pool *pool)
 
 	return worker;
 
+fail_ida:
+	if (pool->attrs->prio == WQ_PRIO_RT)
+		atomic_dec(&total_rtpri_workers);
 fail:
 	ida_free(&pool->worker_ida, id);
 	kfree(worker);
@@ -2909,6 +2937,8 @@ static void reap_dying_workers(struct list_head *cull_list)
 	list_for_each_entry_safe(worker, tmp, cull_list, entry) {
 		list_del_init(&worker->entry);
 		kthread_stop_put(worker->task);
+		if (worker->pool->attrs->prio == WQ_PRIO_RT)
+			atomic_dec(&total_rtpri_workers);
 		kfree(worker);
 	}
 }
@@ -3765,7 +3795,7 @@ static void drain_dead_softirq_workfn(struct work_struct *work)
 	 * don't hog this CPU's BH.
 	 */
 	if (repeat) {
-		if (pool->attrs->nice == HIGHPRI_NICE_LEVEL)
+		if (pool->attrs->prio >= WQ_PRIO_HIGH)
 			queue_work(system_bh_highpri_wq, work);
 		else
 			queue_work(system_bh_wq, work);
@@ -3797,7 +3827,7 @@ void workqueue_softirq_dead(unsigned int cpu)
 		dead_work.pool = pool;
 		init_completion(&dead_work.done);
 
-		if (pool->attrs->nice == HIGHPRI_NICE_LEVEL)
+		if (pool->attrs->prio >= WQ_PRIO_HIGH)
 			queue_work(system_bh_highpri_wq, &dead_work.work);
 		else
 			queue_work(system_bh_wq, &dead_work.work);
@@ -4772,6 +4802,7 @@ fail:
 static void copy_workqueue_attrs(struct workqueue_attrs *to,
 				 const struct workqueue_attrs *from)
 {
+	to->prio = from->prio;
 	to->nice = from->nice;
 	cpumask_copy(to->cpumask, from->cpumask);
 	cpumask_copy(to->__pod_cpumask, from->__pod_cpumask);
@@ -4803,6 +4834,7 @@ static u32 wqattrs_hash(const struct workqueue_attrs *attrs)
 {
 	u32 hash = 0;
 
+	hash = jhash_1word(attrs->prio, hash);
 	hash = jhash_1word(attrs->nice, hash);
 	hash = jhash_1word(attrs->affn_strict, hash);
 	hash = jhash(cpumask_bits(attrs->__pod_cpumask),
@@ -4817,6 +4849,8 @@ static u32 wqattrs_hash(const struct workqueue_attrs *attrs)
 static bool wqattrs_equal(const struct workqueue_attrs *a,
 			  const struct workqueue_attrs *b)
 {
+	if (a->prio != b->prio)
+		return false;
 	if (a->nice != b->nice)
 		return false;
 	if (a->affn_strict != b->affn_strict)
@@ -5603,10 +5637,16 @@ out_unlock:
 
 static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 {
-	bool highpri = wq->flags & WQ_HIGHPRI;
-	int cpu, ret;
+	int prio, cpu, ret;
 
 	lockdep_assert_held(&wq_pool_mutex);
+
+	if (wq->flags & WQ_RTPRI)
+		prio = WQ_PRIO_RT;
+	else if (wq->flags & WQ_HIGHPRI)
+		prio = WQ_PRIO_HIGH;
+	else
+		prio = WQ_PRIO_NORMAL;
 
 	wq->cpu_pwq = alloc_percpu(struct pool_workqueue *);
 	if (!wq->cpu_pwq)
@@ -5624,7 +5664,7 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 			struct pool_workqueue **pwq_p;
 			struct worker_pool *pool;
 
-			pool = &(per_cpu_ptr(pools, cpu)[highpri]);
+			pool = &(per_cpu_ptr(pools, cpu)[prio]);
 			pwq_p = per_cpu_ptr(wq->cpu_pwq, cpu);
 
 			*pwq_p = kmem_cache_alloc_node(pwq_cache, GFP_KERNEL,
@@ -5644,14 +5684,14 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 	if (wq->flags & __WQ_ORDERED) {
 		struct pool_workqueue *dfl_pwq;
 
-		ret = apply_workqueue_attrs_locked(wq, ordered_wq_attrs[highpri]);
+		ret = apply_workqueue_attrs_locked(wq, ordered_wq_attrs[prio]);
 		/* there should only be single pwq for ordering guarantee */
 		dfl_pwq = rcu_access_pointer(wq->dfl_pwq);
 		WARN(!ret && (wq->pwqs.next != &dfl_pwq->pwqs_node ||
 			      wq->pwqs.prev != &dfl_pwq->pwqs_node),
 		     "ordering guarantee broken for workqueue %s\n", wq->name);
 	} else {
-		ret = apply_workqueue_attrs_locked(wq, unbound_std_wq_attrs[highpri]);
+		ret = apply_workqueue_attrs_locked(wq, unbound_std_wq_attrs[prio]);
 	}
 
 	if (ret)
@@ -5816,6 +5856,12 @@ static struct workqueue_struct *__alloc_workqueue(const char *fmt,
 			return NULL;
 	}
 
+	if (flags & WQ_RTPRI) {
+		if (WARN_ON_ONCE((flags & (WQ_HIGHPRI | WQ_UNBOUND)) !=
+			         WQ_UNBOUND))
+			return NULL;
+	}
+
 	/* see the comment above the definition of WQ_POWER_EFFICIENT */
 	if ((flags & WQ_POWER_EFFICIENT) && wq_power_efficient)
 		flags |= WQ_UNBOUND;
@@ -5842,7 +5888,17 @@ static struct workqueue_struct *__alloc_workqueue(const char *fmt,
 		pr_warn_once("workqueue: name exceeds WQ_NAME_LEN. Truncating to: %s\n",
 			     wq->name);
 
-	if (flags & WQ_BH) {
+	if (flags & WQ_RTPRI) {
+		/*
+		 * RT workqueues are limited to max half of possible CPUs to
+		 * avoid scheduling starvation and have strict CPU affinity for
+		 * low latency execution.
+		 */
+		max_active = min_t(int, max_active,
+				   DIV_ROUND_UP(num_possible_cpus(), 2));
+		wq->unbound_attrs->affn_scope = WQ_AFFN_CPU;
+		wq->unbound_attrs->affn_strict = true;
+	} else if (flags & WQ_BH) {
 		/*
 		 * BH workqueues always share a single execution context per CPU
 		 * and don't impose any max_active limit.
@@ -6344,17 +6400,26 @@ void print_worker_info(const char *log_lvl, struct task_struct *task)
 	}
 }
 
+static void pr_cont_bh_suffix(enum wq_priority prio)
+{
+	if (prio == WQ_PRIO_RT)
+		pr_cont("bh-rt");
+	else if (prio == WQ_PRIO_HIGH)
+		pr_cont("bh-hi");
+	else
+		pr_cont("bh");
+}
+
 static void pr_cont_pool_info(struct worker_pool *pool)
 {
 	pr_cont(" cpus=%*pbl", nr_cpumask_bits, pool->attrs->cpumask);
 	if (pool->node != NUMA_NO_NODE)
 		pr_cont(" node=%d", pool->node);
-	pr_cont(" flags=0x%x", pool->flags);
+	pr_cont(" flags=0x%x ", pool->flags);
 	if (pool->flags & POOL_BH)
-		pr_cont(" bh%s",
-			pool->attrs->nice == HIGHPRI_NICE_LEVEL ? "-hi" : "");
+		pr_cont_bh_suffix(pool->attrs->prio);
 	else
-		pr_cont(" nice=%d", pool->attrs->nice);
+		pr_cont("prio=%d", pool->attrs->prio);
 }
 
 static void pr_cont_worker_id(struct worker *worker)
@@ -6362,8 +6427,7 @@ static void pr_cont_worker_id(struct worker *worker)
 	struct worker_pool *pool = worker->pool;
 
 	if (pool->flags & POOL_BH)
-		pr_cont("bh%s",
-			pool->attrs->nice == HIGHPRI_NICE_LEVEL ? "-hi" : "");
+		pr_cont_bh_suffix(pool->attrs->prio);
 	else
 		pr_cont("%d%s", task_pid_nr(worker->task),
 			worker->rescue_wq ? "(RESCUER)" : "");
@@ -7287,7 +7351,11 @@ static ssize_t wq_nice_show(struct device *dev, struct device_attribute *attr,
 	int written;
 
 	mutex_lock(&wq->mutex);
-	written = scnprintf(buf, PAGE_SIZE, "%d\n", wq->unbound_attrs->nice);
+	if (wq->unbound_attrs->prio != WQ_PRIO_RT)
+		written = scnprintf(buf, PAGE_SIZE, "%d\n",
+				    wq->unbound_attrs->nice);
+	else
+		written = -EINVAL;
 	mutex_unlock(&wq->mutex);
 
 	return written;
@@ -7313,13 +7381,20 @@ static ssize_t wq_nice_store(struct device *dev, struct device_attribute *attr,
 {
 	struct workqueue_struct *wq = dev_to_wq(dev);
 	struct workqueue_attrs *attrs;
-	int ret = -ENOMEM;
+	int ret;
 
 	apply_wqattrs_lock();
 
 	attrs = wq_sysfs_prep_attrs(wq);
-	if (!attrs)
+	if (!attrs) {
+		ret = -ENOMEM;
 		goto out_unlock;
+	}
+
+	if (attrs->prio == WQ_PRIO_RT) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 
 	if (sscanf(buf, "%d", &attrs->nice) == 1 &&
 	    attrs->nice >= MIN_NICE && attrs->nice <= MAX_NICE)
@@ -7927,12 +8002,13 @@ static void __init restrict_unbound_cpumask(const char *name, const struct cpuma
 	cpumask_and(wq_unbound_cpumask, wq_unbound_cpumask, mask);
 }
 
-static void __init init_cpu_worker_pool(struct worker_pool *pool, int cpu, int nice)
+static void __init init_cpu_worker_pool(struct worker_pool *pool, int cpu, enum wq_priority prio, int nice)
 {
 	BUG_ON(init_worker_pool(pool));
 	pool->cpu = cpu;
 	cpumask_copy(pool->attrs->cpumask, cpumask_of(cpu));
 	cpumask_copy(pool->attrs->__pod_cpumask, cpumask_of(cpu));
+	pool->attrs->prio = prio;
 	pool->attrs->nice = nice;
 	pool->attrs->affn_strict = true;
 	pool->node = cpu_to_node(cpu);
@@ -7956,7 +8032,8 @@ static void __init init_cpu_worker_pool(struct worker_pool *pool, int cpu, int n
 void __init workqueue_init_early(void)
 {
 	struct wq_pod_type *pt = &wq_pod_types[WQ_AFFN_SYSTEM];
-	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
+	int std_prio[NR_STD_WORKER_POOLS + 1] = { 0, WQ_PRIO_HIGH, WQ_PRIO_RT };
+	int std_nice[NR_STD_WORKER_POOLS + 1] = { 0, HIGHPRI_NICE_LEVEL, 0 };
 	void (*irq_work_fns[NR_STD_WORKER_POOLS])(struct irq_work *) =
 		{ bh_pool_kick_normal, bh_pool_kick_highpri };
 	int i, cpu;
@@ -8008,22 +8085,25 @@ void __init workqueue_init_early(void)
 
 		i = 0;
 		for_each_bh_worker_pool(pool, cpu) {
-			init_cpu_worker_pool(pool, cpu, std_nice[i]);
+			init_cpu_worker_pool(pool, cpu, std_prio[i], std_nice[i]);
 			pool->flags |= POOL_BH;
 			init_irq_work(bh_pool_irq_work(pool), irq_work_fns[i]);
 			i++;
 		}
 
 		i = 0;
-		for_each_cpu_worker_pool(pool, cpu)
-			init_cpu_worker_pool(pool, cpu, std_nice[i++]);
+		for_each_cpu_worker_pool(pool, cpu) {
+			init_cpu_worker_pool(pool, cpu, std_prio[i], std_nice[i]);
+			i++;
+		}
 	}
 
 	/* create default unbound and ordered wq attrs */
-	for (i = 0; i < NR_STD_WORKER_POOLS; i++) {
+	for (i = 0; i < NR_STD_WORKER_POOLS + 1; i++) {
 		struct workqueue_attrs *attrs;
 
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
+		attrs->prio = std_prio[i];
 		attrs->nice = std_nice[i];
 		unbound_std_wq_attrs[i] = attrs;
 
@@ -8032,6 +8112,7 @@ void __init workqueue_init_early(void)
 		 * guaranteed by max_active which is enforced by pwqs.
 		 */
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
+		attrs->prio = std_prio[i];
 		attrs->nice = std_nice[i];
 		attrs->ordered = true;
 		ordered_wq_attrs[i] = attrs;

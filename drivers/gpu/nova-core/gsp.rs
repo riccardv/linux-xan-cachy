@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 mod boot;
+mod hal;
 
 use kernel::{
     debugfs,
@@ -21,24 +22,50 @@ use kernel::{
 pub(crate) mod cmdq;
 pub(crate) mod commands;
 mod fw;
+mod regs;
 mod sequencer;
 
 pub(crate) use fw::{
+    GspFmcBootParams,
     GspFwWprMeta,
     LibosParams, //
 };
 
 use crate::{
-    gsp::cmdq::Cmdq,
-    gsp::fw::{
-        GspArgumentsPadded,
-        LibosMemoryRegionInitArgument, //
+    driver::Bar0,
+    falcon::{
+        gsp::Gsp as GspFalcon,
+        sec2::Sec2 as Sec2Falcon,
+        Falcon, //
+    },
+    gpu::Chipset,
+    gsp::{
+        cmdq::Cmdq,
+        fw::{
+            GspArgumentsPadded,
+            LibosMemoryRegionInitArgument, //
+        },
     },
     num,
 };
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
+
+/// Common context for the GSP boot process.
+pub(crate) struct GspBootContext<'a> {
+    pub(crate) pdev: &'a pci::Device<device::Bound>,
+    pub(crate) bar: Bar0<'a>,
+    pub(crate) chipset: Chipset,
+    pub(crate) gsp_falcon: &'a Falcon<GspFalcon>,
+    pub(crate) sec2_falcon: &'a Falcon<Sec2Falcon>,
+}
+
+impl<'a> GspBootContext<'a> {
+    pub(crate) fn dev(&self) -> &'a device::Device<device::Bound> {
+        self.pdev.as_ref()
+    }
+}
 
 /// Number of GSP pages to use in a RM log buffer.
 const RM_LOG_BUFFER_NUM_PAGES: usize = 0x10;
@@ -183,4 +210,12 @@ impl Gsp {
             }))
         })
     }
+
+    /// Query the GSP for the static GPU information.
+    pub(crate) fn get_static_info(&self, bar: Bar0<'_>) -> Result<commands::GetGspStaticInfoReply> {
+        self.cmdq.send_command(bar, commands::GetGspStaticInfo)
+    }
 }
+
+/// Opaque bundle required to unload the GSP. Created by [`Gsp::boot`], consumed by [`Gsp::unload`].
+pub(crate) struct UnloadBundle(KBox<dyn hal::UnloadBundle>);
