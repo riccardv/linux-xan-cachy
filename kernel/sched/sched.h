@@ -749,6 +749,10 @@ struct cfs_rq {
 	/* Locally cached copy of our task_group's idle value */
 	int			idle;
 
+	/* Infinity: aggregate group EMA and idle timestamp */
+	u64			group_ema;
+	u64			group_ema_sleep_start;
+
 # ifdef CONFIG_CFS_BANDWIDTH
 	int			runtime_enabled;
 	s64			runtime_remaining;
