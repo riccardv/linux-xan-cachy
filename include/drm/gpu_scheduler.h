@@ -233,6 +233,36 @@ struct drm_sched_entity {
 	 */
 	struct rb_node			rb_tree_node;
 
+	/**
+	 * @gpu_time_ema: Infinity EMA of GPU time consumed.
+	 * Unit: ns, ceiling ~10ms. Written under sched->job_list_lock on
+	 * completion (drm_sched_get_finished_job); read under rq->lock during
+	 * scheduling (drm_sched_entity_calc_vtime).  EMA is a heuristic —
+	 * stale reads self-correct.
+	 */
+	u64				gpu_time_ema;
+
+	/**
+	 * @gpu_time_total: Total GPU time consumed (cumulative). Written under
+	 * sched->job_list_lock on completion; read under rq->lock during
+	 * scheduling.  Stale reads degrade fairness temporarily but the
+	 * cumulative value converges as more jobs complete.
+	 */
+	u64				gpu_time_total;
+
+	/**
+	 * @gpu_time_last_active: ktime when entity last had a job submitted.
+	 * Used for EMA decay on idle. Written under rq->lock in the
+	 * scheduling path; read under rq->lock.  Not accessed by the
+	 * completion path.
+	 */
+	ktime_t				gpu_time_last_active;
+
+	/**
+	 * @cached_gpu_vtime: Snapshotted vtime, immutable while in rbtree.
+	 * Protected by rq->lock.
+	 */
+	u64				cached_gpu_vtime;
 };
 
 /**
@@ -256,6 +286,13 @@ struct drm_sched_rq {
 	struct drm_sched_entity		*current_entity;
 	struct list_head		entities;
 	struct rb_root_cached		rb_tree_root;
+
+	/**
+	 * @min_gpu_vtime: Minimum virtual GPU time across all entities.
+	 * Monotonic, only advances forward on entity selection.
+	 * Protected by @lock.
+	 */
+	u64				min_gpu_vtime;
 };
 
 /**
@@ -356,6 +393,23 @@ struct drm_sched_job {
 
 	struct drm_sched_fence		*s_fence;
 	struct drm_sched_entity         *entity;
+
+	/**
+	 * @infinity_entity: Entity that submitted this job.  Used by
+	 * drm_sched_get_finished_job() to apply GPU time accounting on
+	 * completion.  Cleanup occurs in drm_sched_entity_kill() after the
+	 * entity_idle wait (at which point all in-flight jobs are in
+	 * pending_list).  Both the cleanup and the read in
+	 * get_finished_job() are under sched->job_list_lock.
+	 */
+	struct drm_sched_entity         *infinity_entity;
+
+	/**
+	 * @infinity_gpu_ns: GPU time for this job, written by
+	 * drm_sched_job_done() (fence callback, may run in IRQ context).
+	 * Read under sched->job_list_lock in drm_sched_get_finished_job().
+	 */
+	u64				infinity_gpu_ns;
 
 	enum drm_sched_priority		s_priority;
 	u32				credits;
@@ -587,6 +641,7 @@ struct drm_gpu_scheduler {
 	struct delayed_work		work_tdr;
 	struct list_head		pending_list;
 	spinlock_t			job_list_lock;
+
 	int				hang_limit;
 	atomic_t                        *score;
 	atomic_t                        _score;
@@ -749,5 +804,21 @@ class_drm_sched_pending_job_iter_lock_ptr(class_drm_sched_pending_job_iter_t *_T
 	scoped_guard(drm_sched_pending_job_iter, (__sched))			\
 		list_for_each_entry((__job), &(__sched)->pending_list, list)	\
 			for_each_if(!(__entity) || (__job)->entity == (__entity))
+
+/* ------------------------------------------------------------------ */
+/* Infinity GPU scheduling constants                                   */
+/* ------------------------------------------------------------------ */
+#define INFINITY_GPU_EMA_CLIMB_NS       10000000ULL
+#define INFINITY_GPU_EMA_ALPHA          4
+#define INFINITY_GPU_EMA_HALFLIFE_NS    32000000ULL
+#define INFINITY_GPU_CATCHUP_BONUS_NS   5000000ULL
+
+/* ------------------------------------------------------------------ */
+/* Infinity stats counters (accessible from infinity_sched.c)          */
+/* ------------------------------------------------------------------ */
+#include <linux/atomic.h>
+extern atomic_t infinity_gpu_completion_callbacks;
+extern atomic_t infinity_gpu_accounting_applied;
+extern atomic_t infinity_gpu_accounting_skipped;
 
 #endif

@@ -97,7 +97,13 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
 			entity->priority = max_t(s32, (s32) sched_list[0]->num_rqs - 1,
 						 (s32) DRM_SCHED_PRIORITY_KERNEL);
 		}
-		entity->rq = sched_list[0]->sched_rq[entity->priority];
+		{
+			u32 target_prio = sched_list[0]->num_rqs > 1 ?
+				sched_list[0]->num_rqs - 1 : 0;
+			if (target_prio == DRM_SCHED_PRIORITY_KERNEL && target_prio > 0)
+				target_prio--;
+			entity->rq = sched_list[0]->sched_rq[target_prio];
+		}
 	}
 
 	init_completion(&entity->entity_idle);
@@ -244,6 +250,40 @@ static void drm_sched_entity_kill(struct drm_sched_entity *entity)
 
 	/* Make sure this entity is not used by the scheduler at the moment */
 	wait_for_completion(&entity->entity_idle);
+
+	/* Infinity: clear entity pointer on in-flight jobs under job_list_lock.
+	 * Must run AFTER entity_idle so that any job that was in the
+	 * pop_job -> set infinity_entity -> drm_sched_job_begin() window
+	 * is already in pending_list and is found by the scan.
+	 *
+	 * Multi-scheduler: scan ALL schedulers in the entity's sched_list
+	 * (or just the current one if sched_list is NULL / single), because
+	 * entity->rq may have switched since jobs were submitted.
+	 */
+	{
+		struct drm_gpu_scheduler **scan_scheds = NULL;
+		unsigned int n_scan = 0, i;
+
+		if (entity->sched_list) {
+			scan_scheds = entity->sched_list;
+			n_scan = entity->num_sched_list;
+		} else if (entity->rq) {
+			scan_scheds = &entity->rq->sched;
+			n_scan = 1;
+		}
+
+		for (i = 0; i < n_scan; i++) {
+			struct drm_gpu_scheduler *sched = scan_scheds[i];
+			struct drm_sched_job *job;
+
+			spin_lock(&sched->job_list_lock);
+			list_for_each_entry(job, &sched->pending_list, list) {
+				if (READ_ONCE(job->infinity_entity) == entity)
+					WRITE_ONCE(job->infinity_entity, NULL);
+			}
+			spin_unlock(&sched->job_list_lock);
+		}
+	}
 
 	/* The entity is guaranteed to not be used by the scheduler */
 	prev = rcu_dereference_check(entity->last_scheduled, true);
@@ -496,7 +536,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
 	 * Update the entity's location in the min heap according to
 	 * the timestamp of the next job, if any.
 	 */
-	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO) {
+	{
 		struct drm_sched_job *next;
 
 		next = drm_sched_entity_queue_peek(entity);
@@ -506,7 +546,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
 			spin_lock(&entity->lock);
 			rq = entity->rq;
 			spin_lock(&rq->lock);
-			drm_sched_rq_update_fifo_locked(entity, rq,
+			drm_sched_rq_update_vtime_locked(entity, rq,
 							next->submit_ts);
 			spin_unlock(&rq->lock);
 			spin_unlock(&entity->lock);
@@ -552,7 +592,13 @@ void drm_sched_entity_select_rq(struct drm_sched_entity *entity)
 
 	spin_lock(&entity->lock);
 	sched = drm_sched_pick_best(entity->sched_list, entity->num_sched_list);
-	rq = sched ? sched->sched_rq[entity->priority] : NULL;
+	{
+		u32 target_prio = sched && sched->num_rqs > 1 ?
+			sched->num_rqs - 1 : 0;
+		if (target_prio == DRM_SCHED_PRIORITY_KERNEL && target_prio > 0)
+			target_prio--;
+		rq = sched ? sched->sched_rq[target_prio] : NULL;
+	}
 	if (rq != entity->rq) {
 		drm_sched_rq_remove_entity(entity->rq, entity);
 		entity->rq = rq;
@@ -619,8 +665,7 @@ void drm_sched_entity_push_job(struct drm_sched_job *sched_job)
 		spin_lock(&rq->lock);
 		drm_sched_rq_add_entity(rq, entity);
 
-		if (drm_sched_policy == DRM_SCHED_POLICY_FIFO)
-			drm_sched_rq_update_fifo_locked(entity, rq, submit_ts);
+		drm_sched_rq_update_vtime_locked(entity, rq, submit_ts);
 
 		spin_unlock(&rq->lock);
 		spin_unlock(&entity->lock);

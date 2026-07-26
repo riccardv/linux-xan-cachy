@@ -84,14 +84,7 @@
 #define CREATE_TRACE_POINTS
 #include "gpu_scheduler_trace.h"
 
-int drm_sched_policy = DRM_SCHED_POLICY_FIFO;
 
-/**
- * DOC: sched_policy (int)
- * Used to override default entities scheduling policy in a run queue.
- */
-MODULE_PARM_DESC(sched_policy, "Specify the scheduling policy for entities on a run-queue, " __stringify(DRM_SCHED_POLICY_RR) " = Round Robin, " __stringify(DRM_SCHED_POLICY_FIFO) " = FIFO (default).");
-module_param_named(sched_policy, drm_sched_policy, int, 0444);
 
 static u32 drm_sched_available_credits(struct drm_gpu_scheduler *sched)
 {
@@ -133,16 +126,78 @@ static bool drm_sched_can_queue(struct drm_gpu_scheduler *sched,
 	return drm_sched_available_credits(sched) >= s_job->credits;
 }
 
-static __always_inline bool drm_sched_entity_compare_before(struct rb_node *a,
-							    const struct rb_node *b)
+static __always_inline bool
+drm_sched_entity_compare_vtime(struct rb_node *a,
+			       const struct rb_node *b)
 {
-	struct drm_sched_entity *ent_a =  rb_entry((a), struct drm_sched_entity, rb_tree_node);
-	struct drm_sched_entity *ent_b =  rb_entry((b), struct drm_sched_entity, rb_tree_node);
+	struct drm_sched_entity *ent_a = rb_entry(a, struct drm_sched_entity, rb_tree_node);
+	struct drm_sched_entity *ent_b = rb_entry(b, struct drm_sched_entity, rb_tree_node);
 
-	return ktime_before(ent_a->oldest_job_waiting, ent_b->oldest_job_waiting);
+	if (ent_a->cached_gpu_vtime != ent_b->cached_gpu_vtime)
+		return ent_a->cached_gpu_vtime < ent_b->cached_gpu_vtime;
+
+	return ktime_before(ent_a->oldest_job_waiting,
+			    ent_b->oldest_job_waiting);
 }
 
-static void drm_sched_rq_remove_fifo_locked(struct drm_sched_entity *entity,
+static inline u64 drm_sched_entity_calc_vtime(struct drm_sched_entity *entity)
+{
+	struct drm_sched_rq *rq = entity->rq;
+	u64 effective_total;
+	u64 vtime;
+
+	if (entity->gpu_time_total < rq->min_gpu_vtime) {
+		/*
+		 * EMA-gated idle-start priority: if this entity has been idle
+		 * (gpu_time_ema == 0, meaning no recent GPU submissions), do
+		 * NOT apply the catch-up boost.  Use the entity's actual small
+		 * gpu_time_total so it gets sustained scheduling priority.
+		 *
+		 * This naturally handles multi-process browser architectures:
+		 * the GPU EMA is an entity-level signal that decays to 0 when
+		 * idle regardless of which OS process created the entity or
+		 * submitted the jobs.  No cross-scheduler PID tracking needed.
+		 */
+		if (entity->gpu_time_ema == 0) {
+			effective_total = entity->gpu_time_total;
+		} else if (rq->min_gpu_vtime < INFINITY_GPU_CATCHUP_BONUS_NS) {
+			effective_total = 0;
+		} else {
+			effective_total = rq->min_gpu_vtime - INFINITY_GPU_CATCHUP_BONUS_NS;
+		}
+	} else {
+		effective_total = entity->gpu_time_total;
+	}
+
+	vtime = effective_total;
+
+	switch (entity->priority) {
+	case DRM_SCHED_PRIORITY_KERNEL:
+		vtime >>= 2;
+		break;
+	case DRM_SCHED_PRIORITY_HIGH:
+		break;
+	case DRM_SCHED_PRIORITY_NORMAL:
+		vtime = vtime * 3 / 2;
+		break;
+	case DRM_SCHED_PRIORITY_LOW:
+		vtime *= 3;
+		break;
+	default:
+		break;
+	}
+
+	if (entity->gpu_time_ema > 0) {
+		u64 ema_pct = div64_u64(entity->gpu_time_ema * 100ULL,
+					INFINITY_GPU_EMA_CLIMB_NS);
+		u64 boost = vtime * ema_pct / 100;
+		vtime += boost >> 1;
+	}
+
+	return vtime;
+}
+
+static void drm_sched_rq_remove_vtime_locked(struct drm_sched_entity *entity,
 					    struct drm_sched_rq *rq)
 {
 	if (!RB_EMPTY_NODE(&entity->rb_tree_node)) {
@@ -151,24 +206,32 @@ static void drm_sched_rq_remove_fifo_locked(struct drm_sched_entity *entity,
 	}
 }
 
-void drm_sched_rq_update_fifo_locked(struct drm_sched_entity *entity,
+void drm_sched_rq_update_vtime_locked(struct drm_sched_entity *entity,
 				     struct drm_sched_rq *rq,
 				     ktime_t ts)
 {
-	/*
-	 * Both locks need to be grabbed, one to protect from entity->rq change
-	 * for entity from within concurrent drm_sched_entity_select_rq and the
-	 * other to update the rb tree structure.
-	 */
 	lockdep_assert_held(&entity->lock);
 	lockdep_assert_held(&rq->lock);
 
-	drm_sched_rq_remove_fifo_locked(entity, rq);
-
+	drm_sched_rq_remove_vtime_locked(entity, rq);
 	entity->oldest_job_waiting = ts;
 
+	/* Infinity EMA decay on idle */
+	if (entity->gpu_time_last_active) {
+		u64 idle_ns = ktime_to_ns(ktime_sub(ts,
+			entity->gpu_time_last_active));
+		u64 periods = div64_u64(idle_ns,
+			INFINITY_GPU_EMA_HALFLIFE_NS);
+		if (periods > 63)
+			entity->gpu_time_ema = 0;
+		else if (periods)
+			entity->gpu_time_ema >>= periods;
+	}
+	entity->gpu_time_last_active = ts;
+
+	entity->cached_gpu_vtime = drm_sched_entity_calc_vtime(entity);
 	rb_add_cached(&entity->rb_tree_node, &rq->rb_tree_root,
-		      drm_sched_entity_compare_before);
+		      drm_sched_entity_compare_vtime);
 }
 
 /**
@@ -234,108 +297,43 @@ void drm_sched_rq_remove_entity(struct drm_sched_rq *rq,
 	if (rq->current_entity == entity)
 		rq->current_entity = NULL;
 
-	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO)
-		drm_sched_rq_remove_fifo_locked(entity, rq);
+	drm_sched_rq_remove_vtime_locked(entity, rq);
 
 	spin_unlock(&rq->lock);
 }
 
-/**
- * drm_sched_rq_select_entity_rr - Select an entity which could provide a job to run
- *
- * @sched: the gpu scheduler
- * @rq: scheduler run queue to check.
- *
- * Try to find the next ready entity.
- *
- * Return an entity if one is found; return an error-pointer (!NULL) if an
- * entity was ready, but the scheduler had insufficient credits to accommodate
- * its job; return NULL, if no ready entity was found.
- */
+
+
 static struct drm_sched_entity *
-drm_sched_rq_select_entity_rr(struct drm_gpu_scheduler *sched,
-			      struct drm_sched_rq *rq)
-{
-	struct drm_sched_entity *entity;
-
-	spin_lock(&rq->lock);
-
-	entity = rq->current_entity;
-	if (entity) {
-		list_for_each_entry_continue(entity, &rq->entities, list) {
-			if (drm_sched_entity_is_ready(entity))
-				goto found;
-		}
-	}
-
-	list_for_each_entry(entity, &rq->entities, list) {
-		if (drm_sched_entity_is_ready(entity))
-			goto found;
-
-		if (entity == rq->current_entity)
-			break;
-	}
-
-	spin_unlock(&rq->lock);
-
-	return NULL;
-
-found:
-	if (!drm_sched_can_queue(sched, entity)) {
-		/*
-		 * If scheduler cannot take more jobs signal the caller to not
-		 * consider lower priority queues.
-		 */
-		entity = ERR_PTR(-ENOSPC);
-	} else {
-		rq->current_entity = entity;
-		reinit_completion(&entity->entity_idle);
-	}
-
-	spin_unlock(&rq->lock);
-
-	return entity;
-}
-
-/**
- * drm_sched_rq_select_entity_fifo - Select an entity which provides a job to run
- *
- * @sched: the gpu scheduler
- * @rq: scheduler run queue to check.
- *
- * Find oldest waiting ready entity.
- *
- * Return an entity if one is found; return an error-pointer (!NULL) if an
- * entity was ready, but the scheduler had insufficient credits to accommodate
- * its job; return NULL, if no ready entity was found.
- */
-static struct drm_sched_entity *
-drm_sched_rq_select_entity_fifo(struct drm_gpu_scheduler *sched,
-				struct drm_sched_rq *rq)
+drm_sched_rq_select_entity_infinity(struct drm_gpu_scheduler *sched,
+				    struct drm_sched_rq *rq)
 {
 	struct rb_node *rb;
 
 	spin_lock(&rq->lock);
+
 	for (rb = rb_first_cached(&rq->rb_tree_root); rb; rb = rb_next(rb)) {
 		struct drm_sched_entity *entity;
 
 		entity = rb_entry(rb, struct drm_sched_entity, rb_tree_node);
-		if (drm_sched_entity_is_ready(entity)) {
-			/* If we can't queue yet, preserve the current entity in
-			 * terms of fairness.
-			 */
-			if (!drm_sched_can_queue(sched, entity)) {
-				spin_unlock(&rq->lock);
-				return ERR_PTR(-ENOSPC);
-			}
-
-			reinit_completion(&entity->entity_idle);
-			break;
+		if (!drm_sched_entity_is_ready(entity))
+			continue;
+		if (!drm_sched_can_queue(sched, entity)) {
+			spin_unlock(&rq->lock);
+			return ERR_PTR(-ENOSPC);
 		}
-	}
-	spin_unlock(&rq->lock);
+		reinit_completion(&entity->entity_idle);
+		rq->current_entity = entity;
 
-	return rb ? rb_entry(rb, struct drm_sched_entity, rb_tree_node) : NULL;
+		if (entity->cached_gpu_vtime > rq->min_gpu_vtime)
+			rq->min_gpu_vtime = entity->cached_gpu_vtime;
+
+		spin_unlock(&rq->lock);
+		return entity;
+	}
+
+	spin_unlock(&rq->lock);
+	return NULL;
 }
 
 /**
@@ -372,6 +370,23 @@ static void drm_sched_job_done(struct drm_sched_job *s_job, int result)
 
 	atomic_sub(s_job->credits, &sched->credit_count);
 	atomic_dec(sched->score);
+
+	/* Infinity: record GPU duration on the job for deferred accounting
+	 * in drm_sched_get_finished_job().  Running from a dma_fence
+	 * callback (potentially IRQ context) so only WRITE_ONCE + atomic_inc
+	 * are safe here — no spin_locks.
+	 */
+	{
+		u64 gpu_ns;
+
+		gpu_ns = ktime_to_ns(ktime_sub(ktime_get(),
+				     s_job->submit_ts));
+		if (gpu_ns > INFINITY_GPU_EMA_CLIMB_NS)
+			gpu_ns = INFINITY_GPU_EMA_CLIMB_NS;
+
+		WRITE_ONCE(s_job->infinity_gpu_ns, gpu_ns);
+		atomic_inc(&infinity_gpu_completion_callbacks);
+	}
 
 	trace_drm_sched_job_done(s_fence);
 
@@ -555,6 +570,18 @@ static void drm_sched_job_timedout(struct work_struct *work)
 		 * cancelled, at which point it's safe.
 		 */
 		list_del_init(&job->list);
+
+		/*
+		 * Infinity: clear entity pointer on timeout -- the job leaves
+		 * pending_list and may be reinserted later (false timeout).
+		 * If entity_kill scans pending_list during the window between
+		 * this removal and a possible reinsert, it would miss this job.
+		 * Clearing here under job_list_lock guarantees the pointer is
+		 * never stale regardless of the timeout recovery path.
+		 */
+		job->infinity_entity = NULL;
+		job->infinity_gpu_ns = 0;
+
 		spin_unlock(&sched->job_list_lock);
 
 		status = job->sched->ops->timedout_job(job);
@@ -1098,18 +1125,16 @@ static struct drm_sched_entity *
 drm_sched_select_entity(struct drm_gpu_scheduler *sched)
 {
 	struct drm_sched_entity *entity;
-	int i;
 
-	/* Start with the highest priority.
-	 */
-	for (i = DRM_SCHED_PRIORITY_KERNEL; i < sched->num_rqs; i++) {
-		entity = drm_sched_policy == DRM_SCHED_POLICY_FIFO ?
-			drm_sched_rq_select_entity_fifo(sched, sched->sched_rq[i]) :
-			drm_sched_rq_select_entity_rr(sched, sched->sched_rq[i]);
-		if (entity)
-			break;
-	}
+	/* Single unified Infinity queue -- all priorities including KERNEL
+	 * live in the same rbtree.  KERNEL priority gets a 4x vtime boost
+	 * via drm_sched_entity_calc_vtime(). */
+	u32 target_prio = sched->num_rqs > 1 ? sched->num_rqs - 1 : 0;
+	if (target_prio == DRM_SCHED_PRIORITY_KERNEL && target_prio > 0)
+		target_prio--;
 
+	entity = drm_sched_rq_select_entity_infinity(sched,
+			sched->sched_rq[target_prio]);
 	return IS_ERR(entity) ? NULL : entity;
 }
 
@@ -1137,6 +1162,37 @@ drm_sched_get_finished_job(struct drm_gpu_scheduler *sched, bool *have_more)
 	if (job && dma_fence_is_signaled(&job->s_fence->finished)) {
 		/* remove job from pending_list */
 		list_del_init(&job->list);
+
+		/* Infinity: deferred GPU time accounting.
+		 * job_list_lock protects against concurrent infinity_entity
+		 * cleanup in drm_sched_entity_kill().
+		 */
+		{
+			struct drm_sched_entity *inf_entity;
+			u64 gpu_ns;
+
+			inf_entity = READ_ONCE(job->infinity_entity);
+			gpu_ns = READ_ONCE(job->infinity_gpu_ns);
+			if (inf_entity) {
+				/* gpu_ns may be 0 for zero-duration jobs
+				 * (fast queues, simulators).  Accounting
+				 * update with 0 is a no-op on the entity
+				 * fields but still counts as applied.
+				 */
+				if (gpu_ns) {
+					inf_entity->gpu_time_total += gpu_ns;
+					inf_entity->gpu_time_ema += div64_u64(
+						(INFINITY_GPU_EMA_CLIMB_NS -
+						 inf_entity->gpu_time_ema) *
+						gpu_ns * INFINITY_GPU_EMA_ALPHA,
+						INFINITY_GPU_EMA_CLIMB_NS *
+						(1ULL << 8));
+				}
+				atomic_inc(&infinity_gpu_accounting_applied);
+			} else {
+				atomic_inc(&infinity_gpu_accounting_skipped);
+			}
+		}
 
 		/* cancel this job's TO timer */
 		cancel_delayed_work(&sched->work_tdr);
@@ -1254,6 +1310,9 @@ static void drm_sched_run_job_work(struct work_struct *w)
 		drm_sched_run_job_queue(sched);
 		return;
 	}
+
+	/* Infinity: save entity for GPU time tracking in drm_sched_job_done */
+	WRITE_ONCE(sched_job->infinity_entity, entity);
 
 	s_fence = sched_job->s_fence;
 
