@@ -97,13 +97,7 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
 			entity->priority = max_t(s32, (s32) sched_list[0]->num_rqs - 1,
 						 (s32) DRM_SCHED_PRIORITY_KERNEL);
 		}
-		{
-			u32 target_prio = sched_list[0]->num_rqs > 1 ?
-				sched_list[0]->num_rqs - 1 : 0;
-			if (target_prio == DRM_SCHED_PRIORITY_KERNEL && target_prio > 0)
-				target_prio--;
-			entity->rq = sched_list[0]->sched_rq[target_prio];
-		}
+		entity->rq = sched_list[0]->sched_rq[entity->priority];
 	}
 
 	init_completion(&entity->entity_idle);
@@ -116,8 +110,6 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
 
 	atomic_set(&entity->fence_seq, 0);
 	entity->fence_context = dma_fence_context_alloc(2);
-
-	entity->last_user_pid = get_task_pid(current->group_leader, PIDTYPE_PID);
 
 	return 0;
 }
@@ -336,11 +328,6 @@ EXPORT_SYMBOL(drm_sched_entity_flush);
  */
 void drm_sched_entity_fini(struct drm_sched_entity *entity)
 {
-	if (entity->last_user_pid) {
-		put_pid(entity->last_user_pid);
-		entity->last_user_pid = NULL;
-	}
-
 	/*
 	 * If consumption of existing jobs wasn't completed forcefully remove
 	 * them. Also makes sure that the scheduler won't touch this entity any
@@ -509,7 +496,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
 	 * Update the entity's location in the min heap according to
 	 * the timestamp of the next job, if any.
 	 */
-	{
+	if (drm_sched_policy == DRM_SCHED_POLICY_FIFO) {
 		struct drm_sched_job *next;
 
 		next = drm_sched_entity_queue_peek(entity);
@@ -519,7 +506,7 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
 			spin_lock(&entity->lock);
 			rq = entity->rq;
 			spin_lock(&rq->lock);
-			drm_sched_rq_update_vtime_locked(entity, rq,
+			drm_sched_rq_update_fifo_locked(entity, rq,
 							next->submit_ts);
 			spin_unlock(&rq->lock);
 			spin_unlock(&entity->lock);
@@ -565,13 +552,7 @@ void drm_sched_entity_select_rq(struct drm_sched_entity *entity)
 
 	spin_lock(&entity->lock);
 	sched = drm_sched_pick_best(entity->sched_list, entity->num_sched_list);
-	{
-		u32 target_prio = sched && sched->num_rqs > 1 ?
-			sched->num_rqs - 1 : 0;
-		if (target_prio == DRM_SCHED_PRIORITY_KERNEL && target_prio > 0)
-			target_prio--;
-		rq = sched ? sched->sched_rq[target_prio] : NULL;
-	}
+	rq = sched ? sched->sched_rq[entity->priority] : NULL;
 	if (rq != entity->rq) {
 		drm_sched_rq_remove_entity(entity->rq, entity);
 		entity->rq = rq;
@@ -638,7 +619,8 @@ void drm_sched_entity_push_job(struct drm_sched_job *sched_job)
 		spin_lock(&rq->lock);
 		drm_sched_rq_add_entity(rq, entity);
 
-		drm_sched_rq_update_vtime_locked(entity, rq, submit_ts);
+		if (drm_sched_policy == DRM_SCHED_POLICY_FIFO)
+			drm_sched_rq_update_fifo_locked(entity, rq, submit_ts);
 
 		spin_unlock(&rq->lock);
 		spin_unlock(&entity->lock);
