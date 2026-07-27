@@ -93,7 +93,6 @@
 
 #include "autogroup.h"
 #include "pelt.h"
-#include "infinity_sched.h"
 #include "smp.h"
 
 #include "../workqueue_internal.h"
@@ -4743,11 +4742,6 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 
 	init_entity_runnable_average(&p->se);
 
-	/* Infinity: initialise EMA context for all scheduling classes */
-	{
-		struct rq *rq = this_rq();
-		infinity_fork_init(&p->infinity, READ_ONCE(rq->clock));
-	}
 
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))

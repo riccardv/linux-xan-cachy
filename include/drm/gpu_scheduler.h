@@ -233,34 +233,6 @@ struct drm_sched_entity {
 	 */
 	struct rb_node			rb_tree_node;
 
-	/**
-	 * @gpu_time_ema: Infinity EMA of GPU time consumed.
-	 * Unit: ns, ceiling ~10ms. Protected by rq->lock.
-	 */
-	u64				gpu_time_ema;
-
-	/**
-	 * @gpu_time_total: Total GPU time consumed (cumulative). Protected by rq->lock.
-	 */
-	u64				gpu_time_total;
-
-	/**
-	 * @gpu_time_last_active: ktime when entity last had a job submitted.
-	 * Used for EMA decay on idle. Protected by rq->lock.
-	 */
-	ktime_t				gpu_time_last_active;
-
-	/**
-	 * @cached_gpu_vtime: Snapshotted vtime, immutable while in rbtree.
-	 * Protected by rq->lock.
-	 */
-	u64				cached_gpu_vtime;
-
-	/**
-	 * @last_user_pid: PID of the owning process.
-	 * Captured in entity_init, released in entity_fini. No mid-life changes.
-	 */
-	struct pid			*last_user_pid;
 };
 
 /**
@@ -284,13 +256,6 @@ struct drm_sched_rq {
 	struct drm_sched_entity		*current_entity;
 	struct list_head		entities;
 	struct rb_root_cached		rb_tree_root;
-
-	/**
-	 * @min_gpu_vtime: Minimum virtual GPU time across all entities.
-	 * Monotonic, only advances forward on entity selection.
-	 * Protected by @lock.
-	 */
-	u64				min_gpu_vtime;
 };
 
 /**
@@ -391,13 +356,6 @@ struct drm_sched_job {
 
 	struct drm_sched_fence		*s_fence;
 	struct drm_sched_entity         *entity;
-
-	/**
-	 * @infinity_entity: Entity that submitted this job, saved before
-	 * drm_sched_entity_pop_job() clears @entity for UAF safety.  Used
-	 * by drm_sched_job_done() to track GPU time on the submitting entity.
-	 */
-	struct drm_sched_entity         *infinity_entity;
 
 	enum drm_sched_priority		s_priority;
 	u32				credits;
@@ -791,13 +749,5 @@ class_drm_sched_pending_job_iter_lock_ptr(class_drm_sched_pending_job_iter_t *_T
 	scoped_guard(drm_sched_pending_job_iter, (__sched))			\
 		list_for_each_entry((__job), &(__sched)->pending_list, list)	\
 			for_each_if(!(__entity) || (__job)->entity == (__entity))
-
-/* ------------------------------------------------------------------ */
-/* Infinity GPU scheduling constants                                   */
-/* ------------------------------------------------------------------ */
-#define INFINITY_GPU_EMA_CLIMB_NS       10000000ULL
-#define INFINITY_GPU_EMA_ALPHA          4
-#define INFINITY_GPU_EMA_HALFLIFE_NS    32000000ULL
-#define INFINITY_GPU_CATCHUP_BONUS_NS   5000000ULL
 
 #endif

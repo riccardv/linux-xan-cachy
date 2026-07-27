@@ -54,5 +54,6 @@ struct xe_gpu_scheduler {
 };
 
 #define xe_sched_entity		drm_sched_entity
+#define xe_sched_policy		drm_sched_policy
 
 #endif
