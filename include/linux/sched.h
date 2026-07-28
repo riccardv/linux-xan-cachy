@@ -817,23 +817,6 @@ struct kmap_ctrl {
 #endif
 };
 
-struct infinity_ctx {
-	u64		ema;
-	u64		rt_ema;		/* RT EMA: tracks RT CPU burstiness */
-	u64		last_sleep_ns;
-	u64		rt_last_sleep_ns; /* Sleep timestamp for RT EMA decay */
-	bool		futex_waiting;
-
-	/**
-	 * @gpu_passovers: GPU scheduling pass-over count.
-	 * Incremented atomically by the GPU scheduler when this task's
-	 * drm_sched_entity is ready but skipped during selection.
-	 * Read-and-cleared by infinity_wakeup() to accelerate CPU EMA
-	 * decay for GPU-sidelined tasks.
-	 */
-	atomic_t	gpu_passovers;
-};
-
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -888,7 +871,6 @@ struct task_struct {
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
-	struct infinity_ctx		infinity;
 	struct sched_dl_entity		*dl_server;
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
