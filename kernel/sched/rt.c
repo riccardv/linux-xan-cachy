@@ -6,6 +6,7 @@
 
 #include "sched.h"
 #include "pelt.h"
+#include "infinity_sched.h"
 
 int sched_rr_timeslice = RR_TIMESLICE;
 /* More than 4 hours if BW_SHIFT equals 20. */
@@ -983,6 +984,11 @@ static void update_curr_rt(struct rq *rq)
 	if (unlikely(delta_exec <= 0))
 		return;
 
+	/* Infinity: RT EMA climbs with runtime for adaptive RR timeslice */
+	infinity_rt_consume(&donor->infinity, delta_exec);
+
+
+
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct sched_rt_entity *rt_se = &donor->rt;
 
@@ -1437,8 +1443,17 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
 
-	if (flags & ENQUEUE_WAKEUP)
+	if (flags & ENQUEUE_WAKEUP) {
 		rt_se->timeout = 0;
+
+		/* Infinity: RR EMA decay on wakeup for adaptive timeslice */
+		if (p->infinity.rt_last_sleep_ns) {
+			u64 now = rq_clock(rq);
+			if (now > p->infinity.rt_last_sleep_ns)
+				infinity_rt_wakeup(&p->infinity,
+					now - p->infinity.rt_last_sleep_ns);
+		}
+	}
 
 	check_schedstat_required();
 	update_stats_wait_start_rt(rt_rq_of_se(rt_se), rt_se);
@@ -1458,6 +1473,10 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	update_curr_rt(rq);
 	dequeue_rt_entity(rt_se, flags);
+
+	/* Infinity: record sleep timestamp for RR EMA decay */
+	if ((flags & DEQUEUE_SLEEP) && p)
+		p->infinity.rt_last_sleep_ns = rq_clock(rq);
 
 	dequeue_pushable_task(rq, p);
 
@@ -2540,6 +2559,18 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 
 	watchdog(rq, p);
 
+	/* Infinity: force a rogue SCHED_FIFO (>95% rt_ema) to yield natively
+	 * within the RT class -- no cross-class demotion needed.  Kernel
+	 * threads (migration, watchdog, IRQ handlers) are exempt. */
+	if (p->policy != SCHED_RR &&
+	    !(p->flags & PF_KTHREAD) &&
+	    p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
+		requeue_task_rt(rq, p, 0);
+		resched_curr(rq);
+		atomic_inc(&infinity_rt_throttle_count);
+		return;
+	}
+
 	/*
 	 * RR tasks need a special form of time-slice management.
 	 * FIFO tasks have no timeslices.
@@ -2550,7 +2581,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	if (--p->rt.time_slice)
 		return;
 
-	p->rt.time_slice = sched_rr_timeslice;
+	p->rt.time_slice = infinity_rr_timeslice(p, sched_rr_timeslice);
 
 	/*
 	 * Requeue to the end of queue if we (and all of our ancestors) are not
