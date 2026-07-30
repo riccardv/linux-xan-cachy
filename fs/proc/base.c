@@ -3281,6 +3281,19 @@ static int proc_stack_depth(struct seq_file *m, struct pid_namespace *ns,
 }
 #endif /* CONFIG_KSTACK_ERASE_METRICS */
 
+static int proc_infinity_show(struct seq_file *m, struct pid_namespace *ns,
+			      struct pid *pid, struct task_struct *task)
+{
+	struct infinity_ctx *ctx = &task->infinity;
+
+	seq_printf(m, "ema:\t\t%llu\n", ctx->ema);
+	seq_printf(m, "rt_ema:\t\t%llu\n", ctx->rt_ema);
+	seq_printf(m, "futex_waiting:\t%d\n", ctx->futex_waiting);
+	seq_printf(m, "gpu_passovers:\t%d\n",
+		   atomic_read(&ctx->gpu_passovers));
+	return 0;
+}
+
 /*
  * Thread groups
  */
@@ -3305,6 +3318,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_SCHED_AUTOGROUP
 	REG("autogroup",  S_IRUGO|S_IWUSR, proc_pid_sched_autogroup_operations),
 #endif
+	ONE("infinity",   S_IRUGO, proc_infinity_show),
 #ifdef CONFIG_TIME_NS
 	REG("timens_offsets",  S_IRUGO|S_IWUSR, proc_timens_offsets_operations),
 #endif
