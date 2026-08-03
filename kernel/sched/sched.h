@@ -716,10 +716,6 @@ struct cfs_rq {
 		unsigned long	runnable_avg;
 	} removed;
 
-	/* Infinity: aggregate group EMA and idle timestamp */
-	u64			group_ema;
-	u64			group_ema_sleep_start;
-
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	u64			last_update_tg_load_avg;
 	unsigned long		tg_load_avg_contrib;

@@ -354,12 +354,8 @@ void futex_do_wait(struct futex_q *q, struct hrtimer_sleeper *timeout)
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
-		if (!timeout || timeout->task) {
-			/* Infinity: signal futex-waiting for vslice boost on wakeup */
-			current->infinity.futex_waiting = true;
+		if (!timeout || timeout->task)
 			schedule();
-			current->infinity.futex_waiting = false;
-		}
 	}
 	__set_current_state(TASK_RUNNING);
 }
