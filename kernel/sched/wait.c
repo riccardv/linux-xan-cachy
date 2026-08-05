@@ -462,9 +462,18 @@ long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode, long timeout)
 	 * either we see the store to wq_entry->flags in woken_wake_function()
 	 * or woken_wake_function() sees our store to current->state.
 	 */
+	/* Infinity: flag IPC wait for the vslice boost on wakeup.  The store
+	 * precedes the state store so ttwu's acquire observes it; the
+	 * unconditional set/clear is harmless on the WQ_FLAG_WOKEN fast path
+	 * (the enqueue that would consume the flag already happened before
+	 * WOKEN was set, and the flag is cleared again before the task can run
+	 * further).  The sleeper-side clear covers all paths.
+	 */
+	WRITE_ONCE(current->infinity.ipc_waiting, true);
 	set_current_state(mode); /* A */
 	if (!(wq_entry->flags & WQ_FLAG_WOKEN) && !kthread_should_stop_or_park())
 		timeout = schedule_timeout(timeout);
+	WRITE_ONCE(current->infinity.ipc_waiting, false);
 	__set_current_state(TASK_RUNNING);
 
 	/*
