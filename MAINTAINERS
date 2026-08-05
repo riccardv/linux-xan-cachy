@@ -29492,10 +29492,3 @@ S:	Buried alive in reporters
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 F:	*
 F:	*/
-
-INFINITY SCHEDULER
-M:	Galih Tama <galpt@v.recipes>
-L:	https://github.com/galpt/infinity-scheduler
-S:	Maintained
-F:	kernel/sched/infinity_sched.c
-F:	kernel/sched/infinity_sched.h

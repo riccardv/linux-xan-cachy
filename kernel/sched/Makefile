@@ -40,4 +40,3 @@ obj-y += core.o
 obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
-obj-y += infinity_sched.o
