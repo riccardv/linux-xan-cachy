@@ -107,6 +107,9 @@ config NO_HZ_COMMON
 	bool
 	select TICK_ONESHOT
 
+config NO_HZ_FULL
+	bool
+
 choice
 	prompt "Timer tick handling"
 	default NO_HZ_IDLE if NO_HZ
@@ -127,8 +130,9 @@ config NO_HZ_IDLE
 
 	  Most of the time you want to say Y here.
 
-config NO_HZ_FULL
+config NO_HZ_FULL_NODEF
 	bool "Full dynticks system (tickless)"
+	select NO_HZ_FULL
 	# NO_HZ_COMMON dependency
 	# We need at least one periodic CPU for timekeeping
 	depends on SMP
@@ -153,6 +157,8 @@ config NO_HZ_FULL
 
 	 By default, without passing the nohz_full parameter, this behaves just
 	 like NO_HZ_IDLE.
+
+	 Not recommended for desktops, laptops, or mobile devices.
 
 	 If you're a distro say Y.
 
