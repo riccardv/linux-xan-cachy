@@ -16,8 +16,7 @@ config ARCH_HAS_PREEMPT_LAZY
 
 choice
 	prompt "Preemption Model"
-	default PREEMPT_LAZY if ARCH_HAS_PREEMPT_LAZY
-	default PREEMPT_NONE
+	default PREEMPT
 
 config PREEMPT_NONE
 	bool "No Forced Preemption (Server)"
@@ -36,7 +35,7 @@ config PREEMPT_NONE
 	  latencies.
 
 config PREEMPT_VOLUNTARY
-	bool "Voluntary Kernel Preemption (Desktop)"
+	bool "Voluntary Kernel Preemption (Nothing)"
 	depends on !ARCH_HAS_PREEMPT_LAZY
 	depends on !ARCH_NO_PREEMPT
 	depends on !PREEMPT_RT
@@ -54,7 +53,8 @@ config PREEMPT_VOLUNTARY
 	  applications to run more 'smoothly' even when the system is
 	  under load.
 
-	  Select this if you are building a kernel for a desktop system.
+	  Select this for no system in particular (choose Preemptible
+	  instead on a desktop if you know what's good for you).
 
 config PREEMPT
 	bool "Preemptible Kernel (Low-Latency Desktop)"
@@ -86,6 +86,10 @@ config PREEMPT_LAZY
 	  eager to preempt SCHED_NORMAL tasks in an attempt to
 	  reduce lock holder preemption and recover some of the performance
 	  gains seen from using Voluntary preemption.
+
+	  It trades the latency that makes a desktop feel responsive for
+	  throughput, so choose Preemptible instead unless you are building
+	  for a throughput oriented system.
 
 endchoice
 
