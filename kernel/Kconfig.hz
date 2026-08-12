@@ -3,9 +3,28 @@
 # Timer Interrupt Frequency Configuration
 #
 
+#
+# Silent symbols keep CONFIG_HZ_* available to the rest of the tree and to
+# inherited .configs, but they are not choice members. The promptable
+# *_NODEF names are what olddefconfig can stick on; renaming every rate
+# (including 100) means a saved "# CONFIG_HZ_100 is not set" cannot pin the
+# choice away from the MuQSS default.
+#
+config HZ_100
+	bool
+
+config HZ_250
+	bool
+
+config HZ_300
+	bool
+
+config HZ_1000
+	bool
+
 choice
 	prompt "Timer frequency"
-	default HZ_100 if SCHED_MUQSS
+	default HZ_100_NODEF if SCHED_MUQSS
 	default HZ_250_NODEF if !SCHED_MUQSS
 	help
 	 Allows the configuration of the timer frequency. It is customary
@@ -18,8 +37,9 @@ choice
 	 per second.
 
 
-	config HZ_100
+	config HZ_100_NODEF
 		bool "100 HZ"
+		select HZ_100
 	help
 	  100 Hz is a suitable choice in combination with MuQSS which does
 	  not rely on ticks for rescheduling interrupts, and is not Hz limited
@@ -34,6 +54,7 @@ choice
 
 	config HZ_250_NODEF
 		bool "250 HZ"
+		select HZ_250
 	help
 	 250 Hz is a good compromise choice allowing server performance
 	 while also showing good interactive responsiveness even
@@ -45,6 +66,7 @@ choice
 
 	config HZ_300_NODEF
 		bool "300 HZ"
+		select HZ_300
 	help
 	 300 Hz is a good compromise choice allowing server performance
 	 while also showing good interactive responsiveness even
@@ -53,6 +75,7 @@ choice
 
 	config HZ_1000_NODEF
 		bool "1000 HZ"
+		select HZ_1000
 	help
 	 1000 Hz is the preferred choice for desktop systems and other
 	 systems requiring fast interactive responses to events.
@@ -62,9 +85,9 @@ endchoice
 config HZ
 	int
 	default 100 if HZ_100
-	default 250 if HZ_250_NODEF
-	default 300 if HZ_300_NODEF
-	default 1000 if HZ_1000_NODEF
+	default 250 if HZ_250
+	default 300 if HZ_300
+	default 1000 if HZ_1000
 
 config SCHED_HRTICK
 	def_bool HIGH_RES_TIMERS
