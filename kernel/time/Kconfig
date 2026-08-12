@@ -107,21 +107,36 @@ config NO_HZ_COMMON
 	bool
 	select TICK_ONESHOT
 
+#
+# Silent symbols keep CONFIG_NO_HZ_* / CONFIG_HZ_PERIODIC available to the
+# rest of the tree. The promptable *_NODEF names are what olddefconfig can
+# stick on; renaming every choice member (including idle) means a saved
+# "# CONFIG_NO_HZ_IDLE is not set" cannot pin the choice onto full dynticks.
+#
+config HZ_PERIODIC
+	bool
+
+config NO_HZ_IDLE
+	bool
+
 config NO_HZ_FULL
 	bool
 
 choice
 	prompt "Timer tick handling"
-	default NO_HZ_IDLE if NO_HZ
+	default NO_HZ_IDLE_NODEF if NO_HZ
+	default NO_HZ_IDLE_NODEF
 
-config HZ_PERIODIC
+config HZ_PERIODIC_NODEF
 	bool "Periodic timer ticks (constant rate, no dynticks)"
+	select HZ_PERIODIC
 	help
 	  This option keeps the tick running periodically at a constant
 	  rate, even when the CPU doesn't need it.
 
-config NO_HZ_IDLE
+config NO_HZ_IDLE_NODEF
 	bool "Idle dynticks system (tickless idle)"
+	select NO_HZ_IDLE
 	select NO_HZ_COMMON
 	help
 	  This option enables a tickless idle system: timer interrupts
