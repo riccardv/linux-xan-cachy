@@ -1,17 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_SKIP_LISTS_H
 #define _LINUX_SKIP_LISTS_H
+
+/*
+ * Four levels is enough: randomLevel() returns 0..3, and insert only
+ * grows the list one level at a time, so next/prev[4..] were unused.
+ */
+#define SKIPLIST_MAXLEVEL 4
+
 typedef u64 keyType;
-typedef void *valueType;
 
 typedef struct nodeStructure skiplist_node;
 
 struct nodeStructure {
-	int level;	/* Levels in this structure */
 	keyType key;
-	valueType value;
-	skiplist_node *next[8];
-	skiplist_node *prev[8];
+	skiplist_node *next[SKIPLIST_MAXLEVEL];
+	skiplist_node *prev[SKIPLIST_MAXLEVEL];
 };
 
 typedef struct listStructure {
@@ -25,7 +29,7 @@ void skiplist_init(skiplist_node *slnode);
 skiplist *new_skiplist(skiplist_node *slnode);
 void free_skiplist(skiplist *l);
 void skiplist_node_init(skiplist_node *node);
-void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, valueType value, unsigned int randseed);
+void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int randseed);
 void skiplist_delete(skiplist *l, skiplist_node *node);
 
 static inline bool skiplist_node_empty(skiplist_node *node) {

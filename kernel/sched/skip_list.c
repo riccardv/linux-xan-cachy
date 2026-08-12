@@ -29,30 +29,29 @@ new_skiplist: returns a new, empty list
 randomLevel: Returns a random level based on a u64 random seed passed to it.
 In MuQSS, the "niffy" time is used for this purpose.
 
-insert(l,key, value): inserts the binding (key, value) into l. This operation
+insert(l, node, key): inserts node into l ordered by key. This operation
 occurs in O(log n) time.
 
-delnode(slnode, l, node): deletes any binding of key from the l based on the
-actual node value. This operation occurs in O(k) time where k is the
-number of levels of the node in question (max 8). The original delete
-function occurred in O(log n) time and involved a search.
+delnode(slnode, l, node): deletes the node from l. This operation occurs
+in O(k) time where k is the number of levels of the node in question
+(max 4). The original delete function occurred in O(log n) time and
+involved a search.
 
 MuQSS Notes: In this implementation of skiplists, there are bidirectional
-next/prev pointers and the insert function returns a pointer to the actual
-node the value is stored. The key here is chosen by the scheduler so as to
-sort tasks according to the priority list requirements and is no longer used
-by the scheduler after insertion. The scheduler lookup, however, occurs in
-O(1) time because it is always the first item in the level 0 linked list.
-Since the task struct stores a copy of the node pointer upon skiplist_insert,
-it can also remove it much faster than the original implementation with the
-aid of prev<->next pointer manipulation and no searching.
+next/prev pointers. The node is embedded in task_struct; the task is
+recovered with container_of(). The key here is chosen by the scheduler
+so as to sort tasks according to the priority list requirements. The
+scheduler lookup occurs in O(1) time because it is always the first
+item in the level 0 linked list. Since the task struct embeds the node,
+it can also remove it much faster than the original implementation with
+the aid of prev<->next pointer manipulation and no searching.
 
 */
 
 #include <linux/slab.h>
 #include <linux/skip_list.h>
 
-#define MaxNumberOfLevels 8
+#define MaxNumberOfLevels SKIPLIST_MAXLEVEL
 #define MaxLevel (MaxNumberOfLevels - 1)
 
 void skiplist_init(skiplist_node *slnode)
@@ -60,8 +59,6 @@ void skiplist_init(skiplist_node *slnode)
 	int i;
 
 	slnode->key = 0xFFFFFFFFFFFFFFFF;
-	slnode->level = 0;
-	slnode->value = NULL;
 	for (i = 0; i < MaxNumberOfLevels; i++)
 		slnode->next[i] = slnode->prev[i] = slnode;
 }
@@ -96,10 +93,15 @@ void skiplist_node_init(skiplist_node *node)
 
 static inline unsigned int randomLevel(const long unsigned int randseed)
 {
-	return find_first_bit(&randseed, MaxLevel) / 2;
+	/*
+	 * Two bits per extra level (p = 0.25). Search 2*MaxLevel+1 bits
+	 * so the result stays in 0..MaxLevel; this matches the old
+	 * 8-slot arrays whose random height never exceeded 3.
+	 */
+	return find_first_bit(&randseed, MaxLevel * 2 + 1) / 2;
 }
 
-void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, valueType value, unsigned int randseed)
+void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int randseed)
 {
 	skiplist_node *update[MaxNumberOfLevels];
 	skiplist_node *p, *q;
@@ -119,9 +121,7 @@ void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, valueType va
 		update[k] = l->header;
 	}
 
-	node->level = k;
 	node->key = key;
-	node->value = value;
 	do {
 		p = update[k];
 		node->next[k] = p->next[k];
@@ -133,12 +133,26 @@ void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, valueType va
 
 void skiplist_delete(skiplist *l, skiplist_node *node)
 {
-	int k, m = node->level;
+	int k, m;
 
-	for (k = 0; k <= m; k++) {
+	/*
+	 * Insert fills levels contiguously from 0 up and removal zeroes the
+	 * whole node, so a NULL next[] marks the top of this node and stands
+	 * in for the level count the node used to carry.
+	 */
+	for (k = 0; k < MaxNumberOfLevels && node->next[k]; k++) {
 		node->prev[k]->next[k] = node->next[k];
 		node->next[k]->prev[k] = node->prev[k];
 	}
+	m = k - 1;
+	/*
+	 * A node that was never queued has no levels linked at all. Leave
+	 * before decrementing entries, which would otherwise go negative and
+	 * make the emptiness tests in earliest_deadline_task() pass on an
+	 * empty list, handing the caller the header as if it were a task.
+	 */
+	if (WARN_ON_ONCE(m < 0))
+		return;
 	skiplist_node_init(node);
 	if (m == l->level) {
 		while (l->header->next[m] == l->header && l->header->prev[m] == l->header && m > 0)

@@ -812,7 +812,7 @@ static void update_irq_load_avg(struct rq *rq, long delta)
  * Removing from the runqueue. Enter with rq locked. Deleting a task
  * from the skip list is done via the stored node reference in the task struct
  * and does not require a full look up. Thus it occurs in O(k) time where k
- * is the "level" of the list the task was stored at - usually < 4, max 8.
+ * is the "level" of the list the task was stored at - usually 0, max 3.
  */
 static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -944,7 +944,7 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	randseed = (rq->niffies >> 10) & 0xFFFFFFFF;
-	skiplist_insert(rq->sl, &p->node, sl_id, p, randseed);
+	skiplist_insert(rq->sl, &p->node, sl_id, randseed);
 	rq->best_key = rq->node->next[0]->key;
 	if (p->in_iowait)
 		cflags |= SCHED_CPUFREQ_IOWAIT;
@@ -4275,7 +4275,7 @@ static inline struct task_struct
 			if (key >= best_key)
 				break;
 
-			p = next->value;
+			p = container_of(next, struct task_struct, node);
 			if (!smt_schedule(p, rq)) {
 				if (i && !sched_interactive)
 					break;
@@ -4326,7 +4326,7 @@ static inline struct task_struct
 
 	if (unlikely(!rq->sl->entries))
 		return idle;
-	edt = rq->node->next[0]->value;
+	edt = container_of(rq->node->next[0], struct task_struct, node);
 	take_task(rq, cpu, edt);
 	return edt;
 }
@@ -8003,7 +8003,8 @@ static void __init share_and_free_rq(struct rq *leader, struct rq *rq)
 	 * and the leader keeps a phantom entry forever.
 	 */
 	while (rq->sl->entries > 0) {
-		struct task_struct *p = rq->node->next[0]->value;
+		struct task_struct *p = container_of(rq->node->next[0],
+						     struct task_struct, node);
 
 		dequeue_task(rq, p, DEQUEUE_SAVE);
 		enqueue_task(leader, p, ENQUEUE_RESTORE);
