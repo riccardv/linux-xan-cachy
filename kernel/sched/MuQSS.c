@@ -1804,6 +1804,20 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 	int i, this_entries = rq_load(this_rq);
 	cpumask_t tmp;
 
+	/*
+	 * Dest first. Callers hold this_rq->lock, so a remote EDT cannot
+	 * steal p until we drop it. IPI-ing some other idle CPU would
+	 * just have that CPU fail the dest trylock and dest would never
+	 * see TIF_NEED_RESCHED.
+	 */
+	if (!needs_other_cpu(p, cpu_of(this_rq)) &&
+	    smt_schedule(p, this_rq) &&
+	    can_preempt(p, this_rq->rq_prio, this_rq->rq_deadline)) {
+		this_rq->preempting = p;
+		resched_curr(this_rq);
+		return;
+	}
+
 	if (suitable_idle_cpus(p) && resched_best_idle(p, task_cpu(p)))
 		return;
 
@@ -1892,16 +1906,17 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
 static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
 {
 	/*
-	 * Sync wakeups (i.e. those types of wakeups where the waker
-	 * has indicated that it will leave the CPU in short order)
-	 * don't trigger a preemption if there are no idle cpus,
-	 * instead waiting for current to deschedule.
+	 * WF_SYNC means the waker will leave the CPU shortly. Prefer an
+	 * idle CPU and do not preempt the waker itself — it will pick the
+	 * wakee up on the next schedule(). A remote dest still needs
+	 * kicking, or the wakee sits until dest's next tick (or forever
+	 * on a nohz_full hog).
 	 */
-	if (wake_flags & WF_SYNC)
+	if ((wake_flags & WF_SYNC) && rq == this_rq())
 		resched_suitable_idle(p);
 	else
 		try_preempt(p, rq);
-	p->__state = TASK_RUNNING;
+	WRITE_ONCE(p->__state, TASK_RUNNING);
 	trace_sched_wakeup(p);
 }
 
