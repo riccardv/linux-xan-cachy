@@ -58,6 +58,7 @@
 #include <linux/syscalls.h>
 #include <linux/tick.h>
 #include <linux/wait_bit.h>
+#include <linux/completion.h>
 #include <linux/hrtimer_rearm.h>
 #include <linux/smp.h>
 
@@ -7287,6 +7288,285 @@ void wake_up_nohz_cpu(int cpu)
 #endif /* CONFIG_NO_HZ_COMMON */
 
 /*
+ * This is how migration works:
+ *
+ * 1) we invoke migration_cpu_stop() on the target CPU using
+ *    stop_one_cpu().
+ * 2) stopper starts to run (implicitly forcing the migrated thread
+ *    off the CPU)
+ * 3) it checks whether the migrated task is still in the wrong runqueue.
+ * 4) if it's in the wrong runqueue then the migration thread removes
+ *    it and puts it into the right queue.
+ * 5) stopper completes and stop_one_cpu() returns and the migration
+ *    is done.
+ */
+
+/*
+ * move_queued_task - move a queued task to new rq.
+ *
+ * Returns (locked) new rq. Old rq's lock is released. Running tasks
+ * are not on the skiplist, so callers must use task_queued().
+ */
+static struct rq *move_queued_task(struct rq *rq,
+				   struct rq_flags __always_unused *rf,
+				   struct task_struct *p, int new_cpu)
+{
+	lockdep_assert_held(rq->lock);
+
+	dequeue_task(rq, p, 0);
+	set_task_cpu(p, new_cpu);
+	rq_unlock(rq);
+
+	rq = cpu_rq(new_cpu);
+
+	rq_lock(rq);
+	WARN_ON_ONCE(task_cpu(p) != new_cpu);
+	enqueue_task(rq, p, ENQUEUE_MIGRATED);
+	try_preempt(p, rq);
+
+	return rq;
+}
+
+struct set_affinity_pending;
+
+struct migration_arg {
+	struct task_struct		*task;
+	int				dest_cpu;
+	struct set_affinity_pending	*pending;
+};
+
+/*
+ * @refs: number of wait_for_completion()
+ * @stop_pending: is @stop_work in use
+ */
+struct set_affinity_pending {
+	refcount_t		refs;
+	unsigned int		stop_pending;
+	struct completion	done;
+	struct cpu_stop_work	stop_work;
+	struct migration_arg	arg;
+};
+
+static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
+				 struct task_struct *p, int dest_cpu)
+{
+	/* Affinity changed (again). */
+	if (!is_cpu_allowed(p, dest_cpu))
+		return rq;
+
+	return move_queued_task(rq, rf, p, dest_cpu);
+}
+
+static int migration_cpu_stop(void *data)
+{
+	struct migration_arg *arg = data;
+	struct set_affinity_pending *pending = arg->pending;
+	struct task_struct *p = arg->task;
+	struct rq *rq = this_rq();
+	bool complete = false;
+	struct rq_flags rf;
+
+	/*
+	 * The original target CPU might have gone down and we might
+	 * be on another CPU but it doesn't matter.
+	 */
+	local_irq_save(rf.flags);
+	/*
+	 * Flush pending wakeups so we do not miss enforcing cpus_ptr,
+	 * see set_cpus_allowed_ptr()'s TASK_WAKING test.
+	 */
+	flush_smp_call_function_queue();
+
+	raw_spin_lock(&p->pi_lock);
+	rq_lock(rq);
+
+	/*
+	 * If we were passed a pending, then ->stop_pending was set, thus
+	 * p->migration_pending must have remained stable.
+	 */
+	WARN_ON_ONCE(pending && pending != p->migration_pending);
+
+	/*
+	 * If task_rq(p) != rq, it cannot be migrated here, because we're
+	 * holding rq->lock. If p is not queued it cannot get enqueued
+	 * because we're holding p->pi_lock.
+	 */
+	if (task_rq(p) == rq) {
+		if (is_migration_disabled(p))
+			goto out;
+
+		if (pending) {
+			p->migration_pending = NULL;
+			complete = true;
+
+			if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask))
+				goto out;
+		}
+
+		if (task_queued(p))
+			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
+		else
+			p->wake_cpu = arg->dest_cpu;
+	} else if (pending) {
+		/*
+		 * The task moved before the stopper got to run. We're
+		 * holding ->pi_lock, so the allowed mask is stable - if
+		 * it got somewhere allowed, we're done.
+		 */
+		if (cpumask_test_cpu(task_cpu(p), p->cpus_ptr)) {
+			p->migration_pending = NULL;
+			complete = true;
+			goto out;
+		}
+
+		/*
+		 * When migrate_enable() hits a rq mis-match we can't
+		 * reliably determine is_migration_disabled() and so
+		 * have to chase after it.
+		 */
+		WARN_ON_ONCE(!pending->stop_pending);
+		preempt_disable();
+		rq_unlock(rq);
+		raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
+		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
+				    &pending->arg, &pending->stop_work);
+		preempt_enable();
+		return 0;
+	}
+out:
+	if (pending)
+		pending->stop_pending = false;
+	rq_unlock(rq);
+	raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
+
+	if (complete)
+		complete_all(&pending->done);
+
+	return 0;
+}
+
+/*
+ * When given a valid mask, __set_cpus_allowed_ptr() must block until
+ * the designated task is enqueued on an allowed CPU. A running task
+ * is kicked off with the CPU stopper. A migrate_disable() region on
+ * the target delays that move until the outermost migrate_enable();
+ * concurrent waiters share one set_affinity_pending.
+ */
+static int affine_move_task(struct rq *rq, struct task_struct *p,
+			    struct rq_flags *rf, int dest_cpu, unsigned int flags)
+{
+	struct set_affinity_pending my_pending = { }, *pending = NULL;
+	bool stop_pending, complete = false;
+
+	/* Can the task run on the task's current CPU? If so, we're done */
+	if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask)) {
+		/*
+		 * If there are pending waiters, but no pending stop_work,
+		 * then complete now.
+		 */
+		pending = p->migration_pending;
+		if (pending && !pending->stop_pending) {
+			p->migration_pending = NULL;
+			complete = true;
+		}
+
+		task_rq_unlock(rq, p, rf);
+
+		if (complete)
+			complete_all(&pending->done);
+
+		return 0;
+	}
+
+	if (!(flags & SCA_MIGRATE_ENABLE)) {
+		/* serialized by p->pi_lock */
+		if (!p->migration_pending) {
+			refcount_set(&my_pending.refs, 1);
+			init_completion(&my_pending.done);
+			my_pending.arg = (struct migration_arg) {
+				.task = p,
+				.dest_cpu = dest_cpu,
+				.pending = &my_pending,
+			};
+
+			p->migration_pending = &my_pending;
+		} else {
+			pending = p->migration_pending;
+			refcount_inc(&pending->refs);
+			/*
+			 * Affinity has changed, but we've already installed a
+			 * pending. migration_cpu_stop() *must* see this, else
+			 * we risk completing despite a task on a disallowed
+			 * CPU. Serialized by p->pi_lock.
+			 */
+			pending->arg.dest_cpu = dest_cpu;
+		}
+	}
+	pending = p->migration_pending;
+	/*
+	 * !MIGRATE_ENABLE installs a pending if there wasn't one.
+	 * MIGRATE_ENABLE only gets here because the current CPU no
+	 * longer matches, so a concurrent set_cpus_allowed_ptr()
+	 * should still be pending completion.
+	 */
+	if (WARN_ON_ONCE(!pending)) {
+		task_rq_unlock(rq, p, rf);
+		return -EINVAL;
+	}
+
+	if (task_running(rq, p) || READ_ONCE(p->__state) == TASK_WAKING) {
+		/*
+		 * MIGRATE_ENABLE gets here because 'p == current'. For
+		 * anything else we cannot do is_migration_disabled();
+		 * punt and have the stopper handle it race-free.
+		 */
+		stop_pending = pending->stop_pending;
+		if (!stop_pending)
+			pending->stop_pending = true;
+
+		preempt_disable();
+		task_rq_unlock(rq, p, rf);
+		if (!stop_pending) {
+			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
+					    &pending->arg, &pending->stop_work);
+		}
+		preempt_enable();
+
+		if (flags & SCA_MIGRATE_ENABLE)
+			return 0;
+	} else {
+		if (!is_migration_disabled(p)) {
+			if (task_queued(p))
+				rq = move_queued_task(rq, rf, p, dest_cpu);
+
+			if (!pending->stop_pending) {
+				p->migration_pending = NULL;
+				complete = true;
+			}
+		}
+		task_rq_unlock(rq, p, rf);
+
+		if (complete)
+			complete_all(&pending->done);
+	}
+
+	wait_for_completion(&pending->done);
+
+	if (refcount_dec_and_test(&pending->refs))
+		wake_up_var(&pending->refs); /* No UaF, just an address */
+
+	/*
+	 * Block the original owner of &pending until all subsequent
+	 * callers have seen the completion and decremented the refcount
+	 */
+	wait_var_event(&my_pending.refs, !refcount_read(&my_pending.refs));
+
+	WARN_ON_ONCE(my_pending.stop_pending);
+
+	return 0;
+}
+
+/*
  * Change a given task's CPU affinity. Migrate the thread to a
  * proper CPU and schedule it away if the CPU it's executing on
  * is removed from the allowed bitmask.
@@ -7300,7 +7580,6 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 				  u32 flags)
 {
 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
-	bool queued = false, running_wrong = false, kthread;
 	unsigned int dest_cpu;
 	struct rq_flags rf;
 	struct rq *rq;
@@ -7309,10 +7588,12 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
 
-	kthread = !!(p->flags & PF_KTHREAD);
-	if (kthread) {
+	if ((p->flags & PF_KTHREAD) || is_migration_disabled(p)) {
 		/*
-		 * Kernel threads are allowed on online && !active CPUs
+		 * Kernel threads are allowed on online && !active CPUs.
+		 * migrate_disabled() tasks must not fail the dest pick
+		 * on SCA_MIGRATE_ENABLE or we skip set_cpus_allowed_common()
+		 * and never reset p->cpus_ptr.
 		 */
 		cpu_valid_mask = cpu_online_mask;
 	}
@@ -7326,9 +7607,18 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 		goto out;
 	}
 
-	if (!(flags & SCA_MIGRATE_ENABLE) &&
-	    cpumask_equal(&p->cpus_mask, new_mask))
-		goto out;
+	if (!(flags & SCA_MIGRATE_ENABLE)) {
+		if (cpumask_equal(&p->cpus_mask, new_mask))
+			goto out;
+
+		if (WARN_ON_ONCE(p == current &&
+				 is_migration_disabled(p) &&
+				 !cpumask_test_cpu(task_cpu(p), new_mask))) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
 	/*
 	 * Picking a ~random cpu helps in cases where we are changing affinity
 	 * for groups of tasks (ie. cpuset), so that load balancing is not
@@ -7340,7 +7630,6 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 		goto out;
 	}
 
-	queued = task_queued(p);
 	{
 		struct affinity_context ac = {
 			.new_mask = new_mask,
@@ -7350,7 +7639,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 		__do_set_cpus_allowed(p, &ac);
 	}
 
-	if (kthread) {
+	if (p->flags & PF_KTHREAD) {
 		/*
 		 * For kernel threads that do indeed end up on online &&
 		 * !active we want to ensure they are strict per-CPU threads.
@@ -7360,46 +7649,10 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 			p->nr_cpus_allowed != 1);
 	}
 
-	/* Can the task run on the task's current CPU? If so, we're done */
-	if (cpumask_test_cpu(task_cpu(p), new_mask))
-		goto out;
+	return affine_move_task(rq, p, &rf, dest_cpu, flags);
 
-	if (task_running(rq, p)) {
-		/* Task is running on the wrong cpu now, reschedule it. */
-		if (rq == this_rq()) {
-			set_task_cpu(p, dest_cpu);
-			set_tsk_need_resched(p);
-			running_wrong = true;
-		} else
-			resched_task(p);
-	} else {
-		if (queued) {
-			/*
-			 * Switch runqueue locks after dequeueing the task
-			 * here while still holding the pi_lock to be holding
-			 * the correct lock for enqueueing.
-			 */
-			dequeue_task(rq, p, 0);
-			rq_unlock(rq);
-
-			rq = cpu_rq(dest_cpu);
-			rq_lock(rq);
-		}
-		set_task_cpu(p, dest_cpu);
-		if (queued)
-			enqueue_task(rq, p, ENQUEUE_MIGRATED);
-	}
-	if (queued)
-		try_preempt(p, rq);
-	if (running_wrong)
-		preempt_disable();
 out:
 	task_rq_unlock(rq, p, &rf);
-
-	if (running_wrong) {
-		__schedule(true);
-		preempt_enable();
-	}
 
 	return ret;
 }
@@ -9440,7 +9693,8 @@ void set_cpus_allowed_force(struct task_struct *p, const struct cpumask *new_mas
 
 void ___migrate_enable(void)
 {
-	current->cpus_ptr = &current->cpus_mask;
+	__set_cpus_allowed_ptr(current, &current->cpus_mask,
+			       SCA_MIGRATE_ENABLE);
 }
 #else /* !CONFIG_SMP */
 /*
