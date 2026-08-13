@@ -1725,6 +1725,10 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
 		return false;
 
+	/* migrate_disable() must be allowed to finish on an online CPU. */
+	if (is_migration_disabled(p))
+		return cpu_online(cpu);
+
 	if (!(p->flags & PF_KTHREAD))
 		return cpu_active(cpu);
 
@@ -1743,6 +1747,8 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
  */
 static inline bool sched_other_cpu(struct task_struct *p, int cpu)
 {
+	if (unlikely(is_migration_disabled(p) && task_cpu(p) != cpu))
+		return true;
 	if (likely(cpumask_test_cpu(cpu, p->cpus_ptr)))
 		return false;
 	if (p->nr_cpus_allowed == 1) {
@@ -1757,9 +1763,24 @@ static inline bool sched_other_cpu(struct task_struct *p, int cpu)
 
 static inline bool needs_other_cpu(struct task_struct *p, int cpu)
 {
+	if (unlikely(is_migration_disabled(p)))
+		return task_cpu(p) != cpu;
 	if (cpumask_test_cpu(cpu, p->cpus_ptr))
 		return false;
 	return true;
+}
+
+/*
+ * Pin p->cpus_ptr to this CPU so EDT / select_best_cpu cannot steal a
+ * preempted migrate_disable() task. Called under rq->lock on prev.
+ */
+static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+{
+	if (likely(!p->migration_disabled))
+		return;
+	if (p->cpus_ptr != &p->cpus_mask)
+		return;
+	p->cpus_ptr = cpumask_of(cpu_of(rq));
 }
 
 #define cpu_online_map		(*(cpumask_t *)cpu_online_mask)
@@ -2066,6 +2087,9 @@ static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 static int valid_task_cpu(struct task_struct *p)
 {
 	cpumask_t valid_mask;
+
+	if (unlikely(is_migration_disabled(p)))
+		return task_cpu(p);
 
 	/*
 	 * Kthreads may be bound to a CPU that is not yet online (per-CPU
@@ -4645,6 +4669,7 @@ static void __sched notrace __schedule(bool preempt)
 		}
 		rq->preempt = NULL;
 	}
+	migrate_disable_switch(rq, prev);
 #endif
 
 	/*
@@ -7011,6 +7036,11 @@ void dump_cpu_task(int cpu)
 #ifdef CONFIG_SMP
 void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
 {
+	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+		p->cpus_ptr = ctx->new_mask;
+		return;
+	}
+
 	cpumask_copy(&p->cpus_mask, ctx->new_mask);
 	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
 }
@@ -7296,7 +7326,8 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 		goto out;
 	}
 
-	if (cpumask_equal(&p->cpus_mask, new_mask))
+	if (!(flags & SCA_MIGRATE_ENABLE) &&
+	    cpumask_equal(&p->cpus_mask, new_mask))
 		goto out;
 	/*
 	 * Picking a ~random cpu helps in cases where we are changing affinity
@@ -7311,7 +7342,10 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 
 	queued = task_queued(p);
 	{
-		struct affinity_context ac = { .new_mask = new_mask };
+		struct affinity_context ac = {
+			.new_mask = new_mask,
+			.flags = flags,
+		};
 
 		__do_set_cpus_allowed(p, &ac);
 	}
@@ -9406,9 +9440,7 @@ void set_cpus_allowed_force(struct task_struct *p, const struct cpumask *new_mas
 
 void ___migrate_enable(void)
 {
-	/* MuQSS keeps the older (mask, flags) form of this helper. */
-	__set_cpus_allowed_ptr(current, &current->cpus_mask,
-			       SCA_MIGRATE_ENABLE);
+	current->cpus_ptr = &current->cpus_mask;
 }
 #else /* !CONFIG_SMP */
 /*
