@@ -1081,7 +1081,16 @@ static inline void atomic_set_cpu(int cpu, cpumask_t *cpumask)
  */
 static inline void set_cpuidle_map(int cpu)
 {
-	if (likely(cpu_online(cpu)))
+	/*
+	 * Only an active CPU may advertise itself as a wakeup target.
+	 * select_best_cpu() returns resched_best_idle()'s pick directly,
+	 * and that pick comes straight out of this map without consulting
+	 * is_cpu_allowed(), so a CPU on its way down (online but no longer
+	 * active) would keep re-arming itself here every time it idled and
+	 * collect fresh wakeups that sched_cpu_wait_empty() has to chase.
+	 * set_rq_offline() clears the map; this keeps it clear.
+	 */
+	if (likely(cpu_active(cpu)))
 		atomic_set_cpu(cpu, &cpu_idle_map);
 }
 
@@ -1738,6 +1747,10 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 	if (kthread_is_per_cpu(p))
 		return cpu_online(cpu);
 
+	/* Regular kernel threads don't get to stay during offline. */
+	if (cpu_dying(cpu))
+		return false;
+
 	/* But are allowed during online. */
 	return cpu_online(cpu);
 }
@@ -1751,18 +1764,14 @@ static inline bool sched_other_cpu(struct task_struct *p, int cpu)
 {
 	if (unlikely(is_migration_disabled(p) && task_cpu(p) != cpu))
 		return true;
-	if (likely(cpumask_test_cpu(cpu, p->cpus_ptr))) {
-		/*
-		 * Userspace must not be picked on a deactivated CPU.
-		 * Kernel threads (the hotplug thread, per-CPU kthreads)
-		 * and a migrate_disable() pin on this CPU still may.
-		 */
-		if (unlikely(!cpu_active(cpu)) &&
-		    !(p->flags & PF_KTHREAD) &&
-		    !is_migration_disabled(p))
-			return true;
-		return false;
-	}
+	/*
+	 * Defer to the single placement predicate: userspace is refused a
+	 * deactivated CPU, a regular kthread is refused a dying one, while
+	 * per-CPU kthreads and a migrate_disable() pin on this CPU still
+	 * may run there.
+	 */
+	if (likely(cpumask_test_cpu(cpu, p->cpus_ptr)))
+		return !is_cpu_allowed(p, cpu);
 	if (p->nr_cpus_allowed == 1) {
 		cpumask_t valid_mask;
 
@@ -1777,12 +1786,7 @@ static inline bool needs_other_cpu(struct task_struct *p, int cpu)
 {
 	if (unlikely(is_migration_disabled(p)))
 		return task_cpu(p) != cpu;
-	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
-		return true;
-	/* Mirror is_cpu_allowed(): userspace cannot be placed on !active. */
-	if (unlikely(!cpu_active(cpu)) && !(p->flags & PF_KTHREAD))
-		return true;
-	return false;
+	return !is_cpu_allowed(p, cpu);
 }
 
 /*
@@ -2128,9 +2132,16 @@ static int valid_task_cpu(struct task_struct *p)
 	 * be selected despite the affinity mismatch until their CPU is up.
 	 * Userspace tasks are restricted to the active mask as usual.
 	 */
-	if (p->flags & PF_KTHREAD)
+	if (p->flags & PF_KTHREAD) {
 		cpumask_and(&valid_mask, p->cpus_ptr, cpu_online_mask);
-	else
+		/*
+		 * Only KTHREAD_IS_PER_CPU gets to stay on a CPU that is on
+		 * its way down, so do not hand a regular kthread back the
+		 * CPU bind_zero() just moved it off. Mirrors is_cpu_allowed().
+		 */
+		if (!kthread_is_per_cpu(p))
+			cpumask_andnot(&valid_mask, &valid_mask, cpu_dying_mask);
+	} else
 		cpumask_and(&valid_mask, p->cpus_ptr, cpu_active_mask);
 
 	if (unlikely(!cpumask_weight(&valid_mask))) {
@@ -7771,10 +7782,19 @@ static bool bind_zero_skip_affinity(struct task_struct *p, struct rq *rq)
 }
 
 /*
- * Drop @src_cpu from @p's allowed mask under pi+rq lock. If that leaves
- * no active CPU, pin the task to an active fallback (usually CPU0) and
- * remember it with zerobound so unbind_zero() can restore the CPU when
- * it comes back. Queued tasks still sitting on @src_cpu are moved.
+ * Move @p off @src_cpu under pi+rq lock, and only override its affinity
+ * if losing @src_cpu would leave it with no active CPU at all.
+ *
+ * Like mainline, the common case does not touch cpus_mask: an offline or
+ * deactivated CPU is already refused by is_cpu_allowed(), sched_other_cpu(),
+ * needs_other_cpu() and valid_task_cpu(), so the mask needs no editing and
+ * the task keeps the affinity userspace asked for across a hotplug cycle.
+ * Narrowing here would be permanent, as unbind_zero() only restores tasks
+ * that were forced.
+ *
+ * The desperate case still has to put the task somewhere: substitute an
+ * active fallback (usually CPU0) for @src_cpu and record that with
+ * zerobound, which is what unbind_zero() undoes when @src_cpu returns.
  *
  * migrate_disable() tasks keep their pin (cpus_ptr) and are left for
  * wait_empty to wait out; only cpus_mask is updated so migrate_enable()
@@ -7798,15 +7818,15 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 			if (dest >= nr_cpu_ids)
 				dest = cpumask_any(cpu_online_mask);
 			if (dest < nr_cpu_ids) {
+				struct affinity_context ac = {
+					.new_mask = &new_mask
+				};
+
 				cpumask_set_cpu(dest, &new_mask);
 				p->zerobound = true;
+				__do_set_cpus_allowed(p, &ac);
+				bound = 1;
 			}
-		}
-		if (!cpumask_empty(&new_mask)) {
-			struct affinity_context ac = { .new_mask = &new_mask };
-
-			__do_set_cpus_allowed(p, &ac);
-			bound = 1;
 		}
 	}
 
@@ -7828,7 +7848,9 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 
 /*
  * Called from sched_cpu_wait_empty() (sleepable) on the outgoing CPU.
- * Walk every task, rewrite affinity, and move anyone still queued here.
+ * Walk every task and move anyone still queued here. Affinity is only
+ * overridden for the few tasks @src_cpu leaving would otherwise strand,
+ * so on a normal offline this reports nothing.
  */
 static void bind_zero(int src_cpu)
 {
@@ -7849,7 +7871,7 @@ static void bind_zero(int src_cpu)
 	rcu_read_unlock();
 
 	if (bound) {
-		printk(KERN_INFO "MuQSS removed affinity for %d processes to cpu %d\n",
+		printk(KERN_INFO "MuQSS overrode affinity for %d processes left with no active cpu by offlining cpu %d\n",
 		       bound, src_cpu);
 	}
 }
