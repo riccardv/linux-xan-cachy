@@ -165,6 +165,7 @@ config SHARERQ
 #                                               block: FAIR_GROUP_SCHED,
 #                                               CFS_BANDWIDTH, RT_GROUP_SCHED,
 #                                               GROUP_SCHED_*, EXT_GROUP_SCHED)
-#   kernel/Kconfig.preempt                    SCHED_CORE
+#   kernel/Kconfig.preempt                    PREEMPT_RT
+#                                             SCHED_CORE
 #                                             SCHED_CLASS_EXT
 #   kernel/trace/rv/monitors/deadline/Kconfig RV_MON_DEADLINE
