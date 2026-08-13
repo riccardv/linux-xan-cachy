@@ -1810,19 +1810,12 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 	cpumask_t tmp;
 
 	/*
-	 * Dest first. Callers hold this_rq->lock, so a remote EDT cannot
-	 * steal p until we drop it. IPI-ing some other idle CPU would
-	 * just have that CPU fail the dest trylock and dest would never
-	 * see TIF_NEED_RESCHED.
+	 * An idle CPU first: waking one costs less than bouncing a task
+	 * that is already running, and it is what keeps work spread out.
+	 * Only if none is available do we consider preemption, and the
+	 * loop below starts at cpu_order[0] - this_rq - so @p still gets
+	 * to preempt its own dest before any remote runqueue.
 	 */
-	if (!needs_other_cpu(p, cpu_of(this_rq)) &&
-	    smt_schedule(p, this_rq) &&
-	    can_preempt(p, this_rq->rq_prio, this_rq->rq_deadline)) {
-		this_rq->preempting = p;
-		resched_curr(this_rq);
-		return;
-	}
-
 	if (suitable_idle_cpus(p) && resched_best_idle(p, task_cpu(p)))
 		return;
 
