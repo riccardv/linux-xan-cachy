@@ -1518,15 +1518,43 @@ inline int task_curr(const struct task_struct *p)
 	return cpu_curr(task_cpu(p)) == p;
 }
 
+static __always_inline
+int __task_state_match(struct task_struct *p, unsigned int state)
+{
+	if (READ_ONCE(p->__state) & state)
+		return 1;
+
+	if (READ_ONCE(p->saved_state) & state)
+		return -1;
+
+	return 0;
+}
+
+static __always_inline
+int task_state_match(struct task_struct *p, unsigned int state)
+{
+	int match;
+
+	/*
+	 * Serialize against current_save_and_set_rtlock_wait_state(),
+	 * current_restore_rtlock_saved_state(), and __refrigerator().
+	 */
+	raw_spin_lock_irq(&p->pi_lock);
+	match = __task_state_match(p, state);
+	raw_spin_unlock_irq(&p->pi_lock);
+
+	return match;
+}
+
 /*
  * wait_task_inactive - wait for a thread to unschedule.
  *
- * If @match_state is nonzero, it's the @p->__state value just checked and
- * not expected to change.  If it changes, i.e. @p might have woken up,
- * then return zero.  When we succeed in waiting for @p to be off its CPU,
- * we return a positive number (its total switch count).  If a second call
- * a short while later returns the same number, the caller can be sure that
- * @p has remained unscheduled the whole time.
+ * Wait for the thread to block in any of the states set in @match_state.
+ * If it changes, i.e. @p might have woken up, then return zero.  When we
+ * succeed in waiting for @p to be off its CPU, we return a positive number
+ * (its total switch count).  If a second call a short while later returns
+ * the same number, the caller can be sure that @p has remained unscheduled
+ * the whole time.
  *
  * The caller must ensure that the task *will* unschedule sometime soon,
  * else this function might spin for a *long* time. This function can't
@@ -1536,7 +1564,7 @@ inline int task_curr(const struct task_struct *p)
  */
 unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
 {
-	int running, queued;
+	int running, queued, match;
 	struct rq_flags rf;
 	unsigned long ncsw;
 	struct rq *rq;
@@ -1556,7 +1584,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 		 * running somewhere else!
 		 */
 		while (task_running(rq, p)) {
-			if (match_state && unlikely(p->__state != match_state))
+			if (!task_state_match(p, match_state))
 				return 0;
 			cpu_relax();
 		}
@@ -1571,8 +1599,15 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 		running = task_running(rq, p);
 		queued = task_on_rq_queued(p);
 		ncsw = 0;
-		if (!match_state || p->__state == match_state)
+		if ((match = __task_state_match(p, match_state))) {
+			/*
+			 * When matching on p->saved_state, consider this task
+			 * still queued so it will wait.
+			 */
+			if (match < 0)
+				queued = 1;
 			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
+		}
 		task_rq_unlock(rq, p, &rf);
 
 		/*
