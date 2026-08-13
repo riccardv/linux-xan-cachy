@@ -7512,6 +7512,13 @@ static int migration_cpu_stop(void *data)
 				goto out;
 		}
 
+		/*
+		 * Mainline updates the rq clock before __migrate_task() here.
+		 * MuQSS has no need to: dequeue_task() and enqueue_task() each
+		 * call update_clocks() on the runqueue they touch, so niffies,
+		 * which deadlines are based on, is current on both sides of
+		 * the migration. Adding one here would only be redundant.
+		 */
 		if (task_queued(p))
 			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
 		else
