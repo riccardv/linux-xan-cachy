@@ -2167,6 +2167,56 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 	rq_unlock(rq);
 }
 
+/*
+ * Consider @state matched against @p, taking p->saved_state into account.
+ *
+ * The caller holds p::pi_lock if p != current or has preemption disabled
+ * when p == current.
+ *
+ * The rules of saved_state:
+ *
+ *   The related locking code always holds p::pi_lock when updating
+ *   p::saved_state, which means the code is fully serialized in both cases.
+ *
+ *   For PREEMPT_RT, the lock wait and lock wakeups happen via TASK_RTLOCK_WAIT.
+ *   No other bits set. This allows to distinguish all wakeup scenarios.
+ *
+ *   For FREEZER, the wakeup happens via TASK_FROZEN. No other bits set. This
+ *   allows us to prevent early wakeup of tasks before they can be run on
+ *   asymmetric ISA architectures (eg ARMv9).
+ */
+static __always_inline
+bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+{
+	int match;
+
+	if (IS_ENABLED(CONFIG_DEBUG_PREEMPT)) {
+		WARN_ON_ONCE((state & TASK_RTLOCK_WAIT) &&
+			     state != TASK_RTLOCK_WAIT);
+	}
+
+	*success = !!(match = __task_state_match(p, state));
+
+	/*
+	 * Saved state preserves the task state across blocking on
+	 * an RT lock or TASK_FREEZABLE tasks.  If the state matches,
+	 * set p::saved_state to TASK_RUNNING, but do not wake the task
+	 * because it waits for a lock wakeup or __thaw_task(). Also
+	 * indicate success because from the regular waker's point of
+	 * view this has succeeded.
+	 *
+	 * After acquiring the lock the task will restore p::__state
+	 * from p::saved_state which ensures that the regular
+	 * wakeup is not lost. The restore will also set
+	 * p::saved_state to TASK_RUNNING so any further tests will
+	 * not result in false positives vs. @success
+	 */
+	if (match < 0)
+		p->saved_state = TASK_RUNNING;
+
+	return match > 0;
+}
+
 /***
  * try_to_wake_up - wake up a thread
  * @p: the thread to be awakened
@@ -2200,10 +2250,9 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		 *  - we're serialized against set_special_state() by virtue of
 		 *    it disabling IRQs (this allows not taking ->pi_lock).
 		 */
-		if (!(p->__state & state))
+		if (!ttwu_state_match(p, state, &success))
 			goto out;
 
-		success = 1;
 		trace_sched_waking(p);
 		p->__state = TASK_RUNNING;
 		trace_sched_wakeup(p);
@@ -2218,13 +2267,10 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 */
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
 	smp_mb__after_spinlock();
-	if (!(p->__state & state))
+	if (!ttwu_state_match(p, state, &success))
 		goto unlock;
 
 	trace_sched_waking(p);
-
-	/* We're going to change ->state: */
-	success = 1;
 
 	/*
 	 * Ensure we load p->on_rq _after_ p->__state, otherwise it would
