@@ -22,11 +22,14 @@ typedef struct listStructure {
 	int entries;
 	int level;	/* Maximum level of the list
 			(1 more than the number of levels in the list) */
+	u64 best_key;	/* Earliest queued key; lockless hint for EDT */
 	skiplist_node *header; /* pointer to header */
 } skiplist;
 
 void skiplist_init(skiplist_node *slnode);
+void skiplist_cache_init(void);
 skiplist *new_skiplist(skiplist_node *slnode);
+void skiplist_free(skiplist *l);
 void free_skiplist(skiplist *l);
 void skiplist_node_init(skiplist_node *node);
 void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int randseed);

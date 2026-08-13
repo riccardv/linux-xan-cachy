@@ -48,8 +48,12 @@ the aid of prev<->next pointer manipulation and no searching.
 
 */
 
+#include <linux/compiler.h>
+#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/skip_list.h>
+
+static struct kmem_cache *skiplist_cache __read_mostly;
 
 #define MaxNumberOfLevels SKIPLIST_MAXLEVEL
 #define MaxLevel (MaxNumberOfLevels - 1)
@@ -63,13 +67,26 @@ void skiplist_init(skiplist_node *slnode)
 		slnode->next[i] = slnode->prev[i] = slnode;
 }
 
+void __init skiplist_cache_init(void)
+{
+	skiplist_cache = kmem_cache_create("skiplist", sizeof(skiplist),
+					   0, SLAB_HWCACHE_ALIGN, NULL);
+	BUG_ON(!skiplist_cache);
+}
+
 skiplist *new_skiplist(skiplist_node *slnode)
 {
-	skiplist *l = kzalloc(sizeof(skiplist), GFP_ATOMIC);
+	skiplist *l = kmem_cache_zalloc(skiplist_cache, GFP_ATOMIC);
 
 	BUG_ON(!l);
 	l->header = slnode;
+	l->best_key = ~0ULL;
 	return l;
+}
+
+void skiplist_free(skiplist *l)
+{
+	kmem_cache_free(skiplist_cache, l);
 }
 
 void free_skiplist(skiplist *l)
@@ -83,7 +100,7 @@ void free_skiplist(skiplist *l)
 		skiplist_node_init(p);
 		p = q;
 	} while (p != l->header);
-	kfree(l);
+	skiplist_free(l);
 }
 
 void skiplist_node_init(skiplist_node *node)
@@ -114,7 +131,7 @@ void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int
 		update[k] = p;
 	} while (--k >= 0);
 
-	++l->entries;
+	WRITE_ONCE(l->entries, l->entries + 1);
 	k = randomLevel(randseed);
 	if (k > l->level) {
 		k = ++l->level;
@@ -159,5 +176,5 @@ void skiplist_delete(skiplist *l, skiplist_node *node)
 			m--;
 		l->level = m;
 	}
-	l->entries--;
+	WRITE_ONCE(l->entries, l->entries - 1);
 }

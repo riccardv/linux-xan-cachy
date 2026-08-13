@@ -223,12 +223,19 @@ struct rq {
 	unsigned int nr_pinned;
 	u64 nr_switches;
 
-	/* Stored data about rq->curr to work outside rq lock */
-	u64 rq_deadline;
+	/*
+	 * Isolated curr snapshot for lockless peeks. Own cacheline so
+	 * last_jiffy / niffies (and remote synchronise_niffies()) do not
+	 * invalidate it. Under SMT_NICE this is four fields; without it,
+	 * deadline + prio only. Do not pull nr_running, online, or sl in.
+	 */
+	u64 rq_deadline ____cacheline_aligned;
 	int rq_prio;
-
-	/* Best queued id for use outside lock */
-	u64 best_key;
+#ifdef CONFIG_SMT_NICE
+	struct mm_struct *rq_mm;
+	int rq_smt_bias; /* Policy/nice level bias across smt siblings */
+#endif
+	u8 __rq_snap_pad[0] ____cacheline_aligned;
 
 	unsigned long last_scheduler_tick; /* Last jiffy this RQ ticked */
 	unsigned long last_jiffy; /* Last jiffy this RQ updated rq clock */
@@ -240,10 +247,6 @@ struct rq {
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	u64 irq_load_update; /* When we last updated IRQ load */
 	unsigned long irq_load_avg; /* Rolling IRQ load average */
-#endif
-#ifdef CONFIG_SMT_NICE
-	struct mm_struct *rq_mm;
-	int rq_smt_bias; /* Policy/nice level bias across smt siblings */
 #endif
 	/* Accurate timekeeping data */
 	unsigned long user_ns, nice_ns, irq_ns, softirq_ns, system_ns,
@@ -281,6 +284,7 @@ struct rq {
 
 	int *cpu_locality; /* CPU relative cache distance */
 	struct rq **rq_order; /* Shared RQs ordered by relative cache distance */
+	skiplist **sl_order; /* Leaders' skiplists, parallel to rq_order */
 	struct rq **cpu_order; /* RQs of discrete CPUs ordered by distance */
 
 	bool is_leader;
@@ -292,8 +296,6 @@ struct rq {
 	struct rq *smt_leader; /* First logical CPU in SMT siblings */
 	cpumask_t thread_mask;
 	bool has_smt_sibling; /* This CPU has SMT siblings at all */
-	bool (*siblings_idle)(struct rq *rq);
-	/* See if all smt siblings are idle */
 #endif /* CONFIG_SCHED_SMT */
 #ifdef CONFIG_SCHED_MC
 	struct rq *mc_leader; /* First logical CPU in MC siblings */

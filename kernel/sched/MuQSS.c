@@ -808,6 +808,11 @@ static void update_irq_load_avg(struct rq *rq, long delta)
 }
 #endif
 
+static inline void update_best_key(struct rq *rq)
+{
+	WRITE_ONCE(rq->sl->best_key, rq->node->next[0]->key);
+}
+
 /*
  * Removing from the runqueue. Enter with rq locked. Deleting a task
  * from the skip list is done via the stored node reference in the task struct
@@ -817,7 +822,7 @@ static void update_irq_load_avg(struct rq *rq, long delta)
 static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	skiplist_delete(rq->sl, &p->node);
-	rq->best_key = rq->node->next[0]->key;
+	update_best_key(rq);
 	update_clocks(rq);
 
 	if (!(flags & DEQUEUE_SAVE)) {
@@ -945,7 +950,7 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 
 	randseed = (rq->niffies >> 10) & 0xFFFFFFFF;
 	skiplist_insert(rq->sl, &p->node, sl_id, randseed);
-	rq->best_key = rq->node->next[0]->key;
+	update_best_key(rq);
 	if (p->in_iowait)
 		cflags |= SCHED_CPUFREQ_IOWAIT;
 	inc_nr_running(rq);
@@ -1020,12 +1025,7 @@ static int task_prio_bias(struct task_struct *p)
 	return MAX_PRIO - p->static_prio;
 }
 
-static bool smt_always_schedule(struct task_struct __maybe_unused *p, struct rq __maybe_unused *this_rq)
-{
-	return true;
-}
-
-static bool (*smt_schedule)(struct task_struct *p, struct rq *this_rq) = &smt_always_schedule;
+static DEFINE_STATIC_KEY_FALSE(smt_nice_enabled);
 
 /* We've already decided p can run on CPU, now test if it shouldn't for SMT
  * nice reasons. */
@@ -1033,11 +1033,6 @@ static bool smt_should_schedule(struct task_struct *p, struct rq *this_rq)
 {
 	int best_bias, task_bias;
 
-	/* Kernel threads always run */
-	if (unlikely(!p->mm))
-		return true;
-	if (rt_task(p))
-		return true;
 	if (!idleprio_suitable(p))
 		return true;
 	best_bias = best_smt_bias(this_rq);
@@ -1054,6 +1049,16 @@ static bool smt_should_schedule(struct task_struct *p, struct rq *this_rq)
 		return true;
 	/* Sorry, you lose */
 	return false;
+}
+
+static inline bool smt_schedule(struct task_struct *p, struct rq *this_rq)
+{
+	if (!static_branch_unlikely(&smt_nice_enabled))
+		return true;
+	/* Kernel threads and RT tasks always run */
+	if (unlikely(!p->mm) || rt_task(p))
+		return true;
+	return smt_should_schedule(p, this_rq);
 }
 #else /* CONFIG_SMT_NICE */
 #define smt_schedule(p, this_rq) (true)
@@ -1192,7 +1197,7 @@ static int best_mask_cpu(int best_cpu, struct rq *rq, cpumask_t *tmpmask)
 			ranking |= CPUIDLE_DIFF_THREAD;
 		if (!tmp_rq->has_smt_sibling)
 			ranking |= CPUIDLE_NO_SIBLING;
-		else if (!(tmp_rq->siblings_idle(tmp_rq)))
+		else if (!cpumask_subset(&tmp_rq->thread_mask, &cpu_idle_map))
 			ranking |= CPUIDLE_THREAD_BUSY;
 #endif
 		if (ranking < best_ranking) {
@@ -4304,11 +4309,12 @@ static inline struct task_struct
 	u64 best_key = ~0ULL;
 
 	for (i = 0; i < total_runqueues; i++) {
-		struct rq *other_rq = rq_order(rq, i);
+		skiplist *sl = rq->sl_order[i];
+		struct rq *other_rq = NULL;
 		skiplist_node *next;
 		int entries;
 
-		entries = other_rq->sl->entries;
+		entries = READ_ONCE(sl->entries);
 		/*
 		 * Check for queued entres lockless first. The local runqueue
 		 * is locked so entries will always be accurate.
@@ -4316,8 +4322,10 @@ static inline struct task_struct
 		if (!sched_interactive) {
 			/*
 			 * Don't reschedule balance across nodes unless the CPU
-			 * is idle.
+			 * is idle. Non-interactive needs the rq: cpu is read
+			 * before the entries filter.
 			 */
+			other_rq = rq_order(rq, i);
 			if (edt != idle && rq->cpu_locality[other_rq->cpu] > LOCALITY_SMP)
 				break;
 			if (entries <= best_entries)
@@ -4328,27 +4336,28 @@ static inline struct task_struct
 		/* if (i) implies other_rq != rq */
 		if (i) {
 			/* Check for best id queued lockless first */
-			if (other_rq->best_key >= best_key)
+			if (READ_ONCE(sl->best_key) >= best_key)
 				continue;
 
+			other_rq = rq_order(rq, i);
 			if (unlikely(!trylock_rq(rq, other_rq)))
 				continue;
 
 			/* Need to reevaluate entries after locking */
-			entries = other_rq->sl->entries;
+			entries = sl->entries;
 			if (unlikely(!entries)) {
 				unlock_rq(other_rq);
 				continue;
 			}
 		}
 
-		next = other_rq->node;
+		next = sl->header;
 		/*
 		 * In interactive mode we check beyond the best entry on other
 		 * runqueues if we can't get the best for smt or affinity
 		 * reasons.
 		 */
-		while ((next = next->next[0]) != other_rq->node) {
+		while ((next = next->next[0]) != sl->header) {
 			struct task_struct *p;
 			u64 key = next->key;
 
@@ -7904,11 +7913,6 @@ static const cpumask_t *thread_cpumask(int cpu)
 {
 	return topology_sibling_cpumask(cpu);
 }
-/* All this CPU's SMT siblings are idle */
-static bool siblings_cpu_idle(struct rq *rq)
-{
-	return cpumask_subset(&rq->thread_mask, &cpu_idle_map);
-}
 #endif
 #ifdef CONFIG_SCHED_MC
 static const cpumask_t *core_cpumask(int cpu)
@@ -8034,7 +8038,6 @@ static void __init select_leaders(void)
 				if (rq->cpu_locality[other_cpu] > LOCALITY_SMT)
 					rq->cpu_locality[other_cpu] = LOCALITY_SMT;
 			}
-			rq->siblings_idle = siblings_cpu_idle;
 			rq->has_smt_sibling = true;
 			smt_threads = true;
 		}
@@ -8045,7 +8048,7 @@ static void __init select_leaders(void)
 	if (smt_threads) {
 		check_siblings = &check_smt_siblings;
 		wake_siblings = &wake_smt_siblings;
-		smt_schedule = &smt_should_schedule;
+		static_branch_enable(&smt_nice_enabled);
 	}
 #endif
 
@@ -8118,7 +8121,7 @@ static void __init share_and_free_rq(struct rq *leader, struct rq *rq)
 	do_raw_spin_unlock(old_lock);
 
 	kfree(old_node);
-	kfree(old_sl);
+	skiplist_free(old_sl);
 	kfree(old_lock);
 }
 
@@ -8197,6 +8200,12 @@ static int __init share_rqs_stopper(void *unused)
 	unlock_leader_rqs();
 
 	return 0;
+}
+
+static void __init set_rq_order(struct rq *rq, int idx, struct rq *other)
+{
+	rq->rq_order[idx] = other;
+	rq->sl_order[idx] = other->sl;
 }
 
 static void __init setup_rq_orders(void)
@@ -8279,7 +8288,7 @@ static void __init setup_rq_orders(void)
 				rq->cpu_order[total_cpus++] = other_rq;
 				if (other_rq->is_leader) {
 					/* set up RQ orders */
-					rq->rq_order[total_rqs++] = other_rq;
+					set_rq_order(rq, total_rqs++, other_rq);
 				}
 			}
 		}
@@ -8522,6 +8531,7 @@ void __init sched_init(void)
 	INIT_LIST_HEAD(&root_task_group.siblings);
 	init_tg_cgroup_defaults(&root_task_group);
 #endif /* CONFIG_CGROUP_SCHED */
+	skiplist_cache_init();
 	for_each_possible_cpu(i) {
 		rq = cpu_rq(i);
 		rq->node = kmalloc(sizeof(skiplist_node), GFP_ATOMIC);
@@ -8569,9 +8579,6 @@ void __init sched_init(void)
 		int j;
 
 		rq = cpu_rq(i);
-#ifdef CONFIG_SCHED_SMT
-		rq->siblings_idle = sole_cpu_idle;
-#endif
 #ifdef CONFIG_SCHED_MC
 		rq->cache_idle = sole_cpu_idle;
 #endif
@@ -8582,11 +8589,16 @@ void __init sched_init(void)
 			else
 				rq->cpu_locality[j] = LOCALITY_DISTANT;
 		}
+		/* sl_order is O(possible_cpus²) pointers, same as rq_order. */
 		rq->rq_order = kmalloc(cpu_ids * sizeof(struct rq *), GFP_ATOMIC);
+		rq->sl_order = kmalloc(cpu_ids * sizeof(skiplist *), GFP_ATOMIC);
 		rq->cpu_order = kmalloc(cpu_ids * sizeof(struct rq *), GFP_ATOMIC);
-		rq->rq_order[0] = rq->cpu_order[0] = rq;
-		for (j = 1; j < cpu_ids; j++)
-			rq->rq_order[j] = rq->cpu_order[j] = cpu_rq(j);
+		set_rq_order(rq, 0, rq);
+		rq->cpu_order[0] = rq;
+		for (j = 1; j < cpu_ids; j++) {
+			set_rq_order(rq, j, cpu_rq(j));
+			rq->cpu_order[j] = cpu_rq(j);
+		}
 	}
 #endif
 
