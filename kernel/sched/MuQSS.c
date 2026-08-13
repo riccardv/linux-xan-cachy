@@ -7679,6 +7679,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 				  u32 flags)
 {
 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+	cpumask_t *user_mask = NULL;
 	unsigned int dest_cpu;
 	struct rq_flags rf;
 	struct rq *rq;
@@ -7738,6 +7739,17 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 		__do_set_cpus_allowed(p, &ac);
 	}
 
+	/*
+	 * An explicit affinity change supersedes whatever bind_zero() saved
+	 * for restoring later - this mask is the one that is wanted now.
+	 * migrate_enable() only reinstates cpus_mask so it does not count.
+	 */
+	if (unlikely(p->zerobound) && !(flags & SCA_MIGRATE_ENABLE)) {
+		user_mask = p->user_cpus_ptr;
+		p->user_cpus_ptr = NULL;
+		p->zerobound = false;
+	}
+
 	if (p->flags & PF_KTHREAD) {
 		/*
 		 * For kernel threads that do indeed end up on online &&
@@ -7748,7 +7760,10 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 			p->nr_cpus_allowed != 1);
 	}
 
-	return affine_move_task(rq, p, &rf, dest_cpu, flags);
+	ret = affine_move_task(rq, p, &rf, dest_cpu, flags);
+	kfree(user_mask);
+
+	return ret;
 
 out:
 	task_rq_unlock(rq, p, &rf);
@@ -7787,7 +7802,9 @@ static bool bind_zero_skip_affinity(struct task_struct *p, struct rq *rq)
  *
  * The desperate case still has to put the task somewhere: substitute an
  * active fallback (usually CPU0) for @src_cpu and record that with
- * zerobound, which is what unbind_zero() undoes when @src_cpu returns.
+ * zerobound, stashing the mask being replaced in user_cpus_ptr so
+ * unbind_zero() can put back exactly what userspace asked for once
+ * @src_cpu returns.
  *
  * migrate_disable() tasks keep their pin (cpus_ptr) and are left for
  * wait_empty to wait out; only cpus_mask is updated so migrate_enable()
@@ -7795,10 +7812,17 @@ static bool bind_zero_skip_affinity(struct task_struct *p, struct rq *rq)
  */
 static int bind_zero_one(struct task_struct *p, int src_cpu)
 {
+	cpumask_t *user_mask, new_mask;
 	struct rq_flags rf;
 	struct rq *rq;
-	cpumask_t new_mask;
 	int dest, bound = 0;
+
+	/*
+	 * The override below cannot allocate under the runqueue lock, so
+	 * speculatively provide it room for the old mask here. Almost every
+	 * task takes the fast path and hands this straight back.
+	 */
+	user_mask = kmalloc(cpumask_size(), GFP_ATOMIC);
 
 	rq = task_rq_lock(p, &rf);
 
@@ -7815,6 +7839,16 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 					.new_mask = &new_mask
 				};
 
+				/*
+				 * Only the first override saves; a second one
+				 * would only be replacing an already forced
+				 * mask with another.
+				 */
+				if (user_mask && !p->user_cpus_ptr) {
+					cpumask_copy(user_mask, &p->cpus_mask);
+					p->user_cpus_ptr = user_mask;
+					user_mask = NULL;
+				}
 				cpumask_set_cpu(dest, &new_mask);
 				p->zerobound = true;
 				__do_set_cpus_allowed(p, &ac);
@@ -7836,6 +7870,7 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 	}
 
 	task_rq_unlock(rq, p, &rf);
+	kfree(user_mask);
 	return bound;
 }
 
@@ -7870,14 +7905,17 @@ static void bind_zero(int src_cpu)
 }
 
 /*
- * Restore @src_cpu to tasks that bind_zero() had to force onto a
- * fallback. Hold pi+rq so cpus_mask / nr_cpus_allowed stay in lockstep.
- * Unbound kthreads are eligible — only per-CPU / PF_NO_SETAFFINITY
- * threads were skipped on the way out.
+ * Undo the affinity override bind_zero() had to force onto tasks that
+ * @src_cpu leaving would have stranded. Hold pi+rq so cpus_mask /
+ * nr_cpus_allowed stay in lockstep. Unbound kthreads are eligible — only
+ * per-CPU / PF_NO_SETAFFINITY threads were skipped on the way out.
+ *
+ * Restoring the saved mask can take the CPU the task is on right now away
+ * from it, so kick it off exactly like do_set_cpus_allowed() does.
  */
 static void unbind_zero(int src_cpu)
 {
-	int unbound = 0, released = 0;
+	int restored = 0, unbound = 0;
 	struct task_struct *g, *p;
 
 	if (src_cpu == 0)
@@ -7885,6 +7923,7 @@ static void unbind_zero(int src_cpu)
 
 	rcu_read_lock();
 	for_each_process_thread(g, p) {
+		cpumask_t *user_mask = NULL;
 		struct rq_flags rf;
 		struct rq *rq;
 
@@ -7896,26 +7935,63 @@ static void unbind_zero(int src_cpu)
 			task_rq_unlock(rq, p, &rf);
 			continue;
 		}
-		if (!cpumask_test_cpu(src_cpu, &p->cpus_mask)) {
+
+		if (likely(p->user_cpus_ptr)) {
+			/*
+			 * Wait for one of the CPUs the task actually wanted,
+			 * or restoring would strand it all over again. The
+			 * mask is handed to __do_set_cpus_allowed() as its
+			 * own before being freed outside the lock.
+			 */
+			if (cpumask_test_cpu(src_cpu, p->user_cpus_ptr)) {
+				struct affinity_context ac;
+
+				user_mask = p->user_cpus_ptr;
+				p->user_cpus_ptr = NULL;
+				ac = (struct affinity_context) {
+					.new_mask = user_mask
+				};
+				__do_set_cpus_allowed(p, &ac);
+				p->zerobound = false;
+				restored++;
+			}
+		} else if (!cpumask_test_cpu(src_cpu, &p->cpus_mask)) {
+			/*
+			 * bind_zero() had no room to save the old mask, so
+			 * hand @src_cpu back and stop there rather than
+			 * accumulate every CPU that ever comes online.
+			 */
 			cpumask_set_cpu(src_cpu, &p->cpus_mask);
 			p->nr_cpus_allowed = cpumask_weight(&p->cpus_mask);
+			p->zerobound = false;
 			unbound++;
 		}
-		if (cpumask_subset(cpu_possible_mask, &p->cpus_mask)) {
-			p->zerobound = false;
-			released++;
+
+		if (!p->zerobound && needs_other_cpu(p, task_cpu(p))) {
+			int dest = valid_task_cpu(p);
+
+			if (task_queued(p))
+				rq = move_queued_task(rq, &rf, p, dest);
+			else if (!task_running(rq, p))
+				p->wake_cpu = dest;
+			else {
+				set_task_cpu(p, dest);
+				resched_task(p);
+			}
 		}
+
 		task_rq_unlock(rq, p, &rf);
+		kfree(user_mask);
 	}
 	rcu_read_unlock();
 
+	if (restored) {
+		printk(KERN_INFO "MuQSS restored the original affinity of %d processes by onlining cpu %d\n",
+		       restored, src_cpu);
+	}
 	if (unbound) {
 		printk(KERN_INFO "MuQSS added affinity for %d processes to cpu %d\n",
 		       unbound, src_cpu);
-	}
-	if (released) {
-		printk(KERN_INFO "MuQSS released forced binding to cpu0 for %d processes\n",
-		       released);
 	}
 }
 
@@ -10038,13 +10114,40 @@ EXPORT_SYMBOL_GPL(___migrate_enable);
 
 /*
  * user_cpus_ptr records an affinity mask requested by userspace so that it can
- * be restored after a temporary restriction. MuQSS does not narrow affinities
- * behind userspace's back, but the fork and exit paths still call these.
+ * be restored after a temporary restriction. The only thing that restricts an
+ * affinity behind userspace's back in MuQSS is bind_zero(), so a task with one
+ * saved here is one waiting on unbind_zero(); zerobound is copied to the child
+ * by dup_task_struct() so the mask that goes with it has to be copied too.
  */
 int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
 		      int node)
 {
+	cpumask_t *user_mask;
+	unsigned long flags;
+
 	dst->user_cpus_ptr = NULL;
+
+	/*
+	 * Racing here is harmless: losing it just means the child forgoes a
+	 * restore it would have got for free, and taking the pi_lock on every
+	 * fork to close it is not worth that.
+	 */
+	if (data_race(!src->user_cpus_ptr))
+		return 0;
+
+	user_mask = kmalloc_node(cpumask_size(), GFP_KERNEL, node);
+	if (!user_mask)
+		return -ENOMEM;
+
+	raw_spin_lock_irqsave(&src->pi_lock, flags);
+	if (src->user_cpus_ptr) {
+		swap(dst->user_cpus_ptr, user_mask);
+		cpumask_copy(dst->user_cpus_ptr, src->user_cpus_ptr);
+	}
+	raw_spin_unlock_irqrestore(&src->pi_lock, flags);
+
+	kfree(user_mask);
+
 	return 0;
 }
 
