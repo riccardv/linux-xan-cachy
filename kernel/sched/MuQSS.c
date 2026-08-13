@@ -6516,7 +6516,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	cpuset_cpus_allowed(p, cpus_allowed);
 	cpumask_and(new_mask, in_mask, cpus_allowed);
 again:
-	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK);
+	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK | SCA_USER);
 
 	if (!retval) {
 		cpuset_cpus_allowed(p, cpus_allowed);
@@ -7175,6 +7175,16 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 void do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 {
 	__do_set_cpus_allowed(p, ctx);
+
+	/*
+	 * A mask forced by cpuset or kthread_bind is a change of what the
+	 * task wants, so an override bind_zero() had to make must not be
+	 * restored over the top of it later. What was saved is left in place
+	 * rather than freed, which here would be under pi_lock.
+	 */
+	if (ctx->flags & SCA_USER)
+		p->zerobound = false;
+
 	if (needs_other_cpu(p, task_cpu(p))) {
 		struct rq *rq;
 
@@ -7666,6 +7676,27 @@ static int affine_move_task(struct rq *rq, struct task_struct *p,
 }
 
 /*
+ * Record @new_mask as the affinity userspace asked for, handing back the
+ * allocation it displaced for the caller to free once the locks are
+ * dropped. An explicit request also supersedes any override bind_zero()
+ * had to force, since this mask is the one that is wanted now.
+ */
+static cpumask_t *set_user_cpus_ptr(struct task_struct *p,
+				    const struct cpumask *new_mask,
+				    cpumask_t *user_mask)
+{
+	lockdep_assert_held(&p->pi_lock);
+
+	if (user_mask) {
+		cpumask_copy(user_mask, new_mask);
+		swap(p->user_cpus_ptr, user_mask);
+	}
+	p->zerobound = false;
+
+	return user_mask;
+}
+
+/*
  * Change a given task's CPU affinity. Migrate the thread to a
  * proper CPU and schedule it away if the CPU it's executing on
  * is removed from the allowed bitmask.
@@ -7684,6 +7715,16 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	struct rq_flags rf;
 	struct rq *rq;
 	int ret = 0;
+
+	/*
+	 * user_cpus_ptr keeps what userspace asked for so that
+	 * relax_compatible_cpus_allowed_ptr() and unbind_zero() have
+	 * something to put back. Only sched_setaffinity() passes SCA_USER
+	 * and it is always sleepable, so make room before taking any lock;
+	 * failing here only costs the task that restore, not the syscall.
+	 */
+	if (flags & SCA_USER)
+		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
 
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
@@ -7708,8 +7749,18 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	}
 
 	if (!(flags & SCA_MIGRATE_ENABLE)) {
-		if (cpumask_equal(&p->cpus_mask, new_mask))
+		if (cpumask_equal(&p->cpus_mask, new_mask)) {
+			/*
+			 * Nothing to change, but asking for exactly the mask
+			 * bind_zero() forced is still userspace choosing it,
+			 * and takes over from the restore. An internal caller
+			 * changing nothing must not cost the task that.
+			 */
+			if (flags & SCA_USER)
+				user_mask = set_user_cpus_ptr(p, new_mask,
+							      user_mask);
 			goto out;
+		}
 
 		if (WARN_ON_ONCE(p == current &&
 				 is_migration_disabled(p) &&
@@ -7740,15 +7791,11 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	}
 
 	/*
-	 * An explicit affinity change supersedes whatever bind_zero() saved
-	 * for restoring later - this mask is the one that is wanted now.
-	 * migrate_enable() only reinstates cpus_mask so it does not count.
+	 * migrate_enable() only reinstates cpus_mask, so it is not a change
+	 * of what the task wants and must not disturb what is saved.
 	 */
-	if (unlikely(p->zerobound) && !(flags & SCA_MIGRATE_ENABLE)) {
-		user_mask = p->user_cpus_ptr;
-		p->user_cpus_ptr = NULL;
-		p->zerobound = false;
-	}
+	if (!(flags & SCA_MIGRATE_ENABLE))
+		user_mask = set_user_cpus_ptr(p, new_mask, user_mask);
 
 	if (p->flags & PF_KTHREAD) {
 		/*
@@ -7767,6 +7814,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 
 out:
 	task_rq_unlock(rq, p, &rf);
+	kfree(user_mask);
 
 	return ret;
 }
@@ -7842,12 +7890,23 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 				/*
 				 * Only the first override saves; a second one
 				 * would only be replacing an already forced
-				 * mask with another.
+				 * mask with another. What is being displaced
+				 * is what has to come back, so it takes over
+				 * any mask sched_setaffinity() left here -
+				 * reusing its allocation - rather than let a
+				 * request cpusets have since narrowed be
+				 * restored wider than the cpuset allows.
 				 */
-				if (user_mask && !p->user_cpus_ptr) {
-					cpumask_copy(user_mask, &p->cpus_mask);
-					p->user_cpus_ptr = user_mask;
-					user_mask = NULL;
+				if (!p->zerobound) {
+					if (p->user_cpus_ptr) {
+						cpumask_copy(p->user_cpus_ptr,
+							     &p->cpus_mask);
+					} else if (user_mask) {
+						cpumask_copy(user_mask,
+							     &p->cpus_mask);
+						p->user_cpus_ptr = user_mask;
+						user_mask = NULL;
+					}
 				}
 				cpumask_set_cpu(dest, &new_mask);
 				p->zerobound = true;
@@ -7923,7 +7982,6 @@ static void unbind_zero(int src_cpu)
 
 	rcu_read_lock();
 	for_each_process_thread(g, p) {
-		cpumask_t *user_mask = NULL;
 		struct rq_flags rf;
 		struct rq *rq;
 
@@ -7940,17 +7998,15 @@ static void unbind_zero(int src_cpu)
 			/*
 			 * Wait for one of the CPUs the task actually wanted,
 			 * or restoring would strand it all over again. The
-			 * mask is handed to __do_set_cpus_allowed() as its
-			 * own before being freed outside the lock.
+			 * saved mask stays put once copied back: it is still
+			 * what the task wants, and what a later override or
+			 * relax_compatible_cpus_allowed_ptr() restores.
 			 */
 			if (cpumask_test_cpu(src_cpu, p->user_cpus_ptr)) {
-				struct affinity_context ac;
-
-				user_mask = p->user_cpus_ptr;
-				p->user_cpus_ptr = NULL;
-				ac = (struct affinity_context) {
-					.new_mask = user_mask
+				struct affinity_context ac = {
+					.new_mask = p->user_cpus_ptr
 				};
+
 				__do_set_cpus_allowed(p, &ac);
 				p->zerobound = false;
 				restored++;
@@ -7981,7 +8037,6 @@ static void unbind_zero(int src_cpu)
 		}
 
 		task_rq_unlock(rq, p, &rf);
-		kfree(user_mask);
 	}
 	rcu_read_unlock();
 
@@ -9969,11 +10024,33 @@ int dl_task_check_affinity(struct task_struct *p __always_unused,
 }
 
 #ifdef CONFIG_SMP
+/* Callers must hold p->pi_lock across the read and its use. */
 static const struct cpumask *task_user_cpus(struct task_struct *p)
 {
+	lockdep_assert_held(&p->pi_lock);
+
 	if (!p->user_cpus_ptr)
 		return cpu_possible_mask;
 	return p->user_cpus_ptr;
+}
+
+/*
+ * Copy out the intersection of the task's user-requested mask and @mask.
+ * pi_lock keeps user_cpus_ptr alive for the copy: everything that frees it
+ * clears the pointer under task_rq_lock(), which nests pi_lock, and only
+ * frees once that has been dropped.
+ */
+static bool user_cpus_and(struct task_struct *p, struct cpumask *dst,
+			  const struct cpumask *mask)
+{
+	unsigned long flags;
+	bool ret;
+
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	ret = cpumask_and(dst, task_user_cpus(p), mask);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	return ret;
 }
 
 /*
@@ -9984,7 +10061,7 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
 				     struct cpumask *new_mask,
 				     const struct cpumask *subset_mask)
 {
-	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask))
+	if (!user_cpus_and(p, new_mask, subset_mask))
 		return -EINVAL;
 
 	return __set_cpus_allowed_ptr(p, new_mask, 0);
@@ -10049,7 +10126,7 @@ void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
 		goto out_free_cpus_allowed;
 
 	cpuset_cpus_allowed(p, cpus_allowed);
-	cpumask_and(new_mask, task_user_cpus(p), cpus_allowed);
+	user_cpus_and(p, new_mask, cpus_allowed);
 	ret = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK);
 
 	free_cpumask_var(new_mask);
@@ -10113,11 +10190,12 @@ void ___migrate_enable(void)
 EXPORT_SYMBOL_GPL(___migrate_enable);
 
 /*
- * user_cpus_ptr records an affinity mask requested by userspace so that it can
- * be restored after a temporary restriction. The only thing that restricts an
- * affinity behind userspace's back in MuQSS is bind_zero(), so a task with one
- * saved here is one waiting on unbind_zero(); zerobound is copied to the child
- * by dup_task_struct() so the mask that goes with it has to be copied too.
+ * user_cpus_ptr records the affinity a task asked for so that it can be
+ * restored after a temporary restriction: sched_setaffinity() stores it, and
+ * bind_zero() stores the mask it displaces from a task that would otherwise
+ * have been stranded by a CPU going down. Either way the child inherits both
+ * the restriction (zerobound, copied by dup_task_struct()) and the mask that
+ * has to be put back for it.
  */
 int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
 		      int node)
