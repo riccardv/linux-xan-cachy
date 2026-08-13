@@ -60,6 +60,7 @@
 #include <linux/wait_bit.h>
 #include <linux/completion.h>
 #include <linux/hrtimer_rearm.h>
+#include <linux/livepatch_sched.h>
 #include <linux/smp.h>
 
 #include <asm/irq_regs.h>
@@ -4678,7 +4679,12 @@ static void wake_siblings(struct rq __maybe_unused *this_rq) {}
  *
  * WARNING: must be called with preemption disabled!
  */
-static void __sched notrace __schedule(bool preempt)
+#define SM_IDLE			(-1)
+#define SM_NONE			0
+#define SM_PREEMPT		1
+#define SM_RTLOCK_WAIT		2
+
+static void __sched notrace __schedule(int sched_mode)
 {
 	struct task_struct *prev, *next, *idle;
 	unsigned long *switch_count;
@@ -4687,6 +4693,13 @@ static void __sched notrace __schedule(bool preempt)
 	struct rq *rq;
 	u64 niffies;
 	int cpu;
+	/*
+	 * On PREEMPT_RT, SM_RTLOCK_WAIT is noted as a preemption by
+	 * schedule_debug() and RCU. Task-state changes still treat
+	 * only SM_PREEMPT as preemption so a sleeping lock wait can
+	 * deactivate.
+	 */
+	bool preempt = sched_mode > SM_NONE;
 
 	cpu = smp_processor_id();
 	rq = cpu_rq(cpu);
@@ -4694,6 +4707,8 @@ static void __sched notrace __schedule(bool preempt)
 	idle = rq->idle;
 
 	schedule_debug(prev, preempt);
+
+	klp_sched_try_switch(prev);
 
 	local_irq_disable();
 	rcu_note_context_switch(preempt);
@@ -4722,7 +4737,8 @@ static void __sched notrace __schedule(bool preempt)
 		 * locklessly on a task that has since scheduled away. Spurious
 		 * wakeup of idle is okay though.
 		 */
-		if (unlikely(preempt && prev != idle && !test_tsk_need_resched(prev))) {
+		if (unlikely(sched_mode == SM_PREEMPT && prev != idle &&
+			     !test_tsk_need_resched(prev))) {
 			rq->preempt = NULL;
 			clear_preempt_need_resched();
 			rq_unlock_irq(rq, NULL);
@@ -4740,6 +4756,9 @@ static void __sched notrace __schedule(bool preempt)
 	hrexpiry_schedule_enter(rq);
 
 	switch_count = &prev->nivcsw;
+
+	/* Task state changes only consider SM_PREEMPT as preemption */
+	preempt = sched_mode == SM_PREEMPT;
 
 	/*
 	 * We must load prev->__state once (task_struct::state is volatile), such
@@ -4877,7 +4896,7 @@ void __noreturn do_task_dead(void)
 
 	/* Tell freezer to ignore us: */
 	current->flags |= PF_NOFREEZE;
-	__schedule(false);
+	__schedule(SM_NONE);
 	BUG();
 
 	/* Avoid "noreturn function does return" - but don't continue if BUG() is a NOP: */
@@ -4930,16 +4949,24 @@ static inline void sched_update_worker(struct task_struct *tsk)
 	}
 }
 
+static __always_inline void __schedule_loop(int sched_mode)
+{
+	do {
+		preempt_disable();
+		__schedule(sched_mode);
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+}
+
 asmlinkage __visible void __sched schedule(void)
 {
 	struct task_struct *tsk = current;
 
+#ifdef CONFIG_RT_MUTEXES
+	lockdep_assert(!tsk->sched_rt_mutex);
+#endif
 	sched_submit_work(tsk);
-	do {
-		preempt_disable();
-		__schedule(false);
-		sched_preempt_enable_no_resched();
-	} while (need_resched());
+	__schedule_loop(SM_NONE);
 	sched_update_worker(tsk);
 }
 
@@ -4966,7 +4993,7 @@ void __sched schedule_idle(void)
 	 */
 	WARN_ON_ONCE(current->__state);
 	do {
-		__schedule(false);
+		__schedule(SM_IDLE);
 	} while (need_resched());
 }
 
@@ -5001,6 +5028,14 @@ void __sched schedule_preempt_disabled(void)
 	preempt_disable();
 }
 
+#ifdef CONFIG_PREEMPT_RT
+void __sched notrace schedule_rtlock(void)
+{
+	__schedule_loop(SM_RTLOCK_WAIT);
+}
+NOKPROBE_SYMBOL(schedule_rtlock);
+#endif
+
 static void __sched notrace preempt_schedule_common(void)
 {
 	do {
@@ -5019,7 +5054,7 @@ static void __sched notrace preempt_schedule_common(void)
 		 */
 		preempt_disable_notrace();
 		preempt_latency_start(1);
-		__schedule(true);
+		__schedule(SM_PREEMPT);
 		preempt_latency_stop(1);
 		preempt_enable_no_resched_notrace();
 
@@ -5114,7 +5149,7 @@ asmlinkage __visible void __sched notrace preempt_schedule_notrace(void)
 		 * an infinite recursion.
 		 */
 		prev_ctx = exception_enter();
-		__schedule(true);
+		__schedule(SM_PREEMPT);
 		exception_exit(prev_ctx);
 
 		preempt_latency_stop(1);
@@ -5394,7 +5429,7 @@ asmlinkage __visible void __sched preempt_schedule_irq(void)
 	do {
 		preempt_disable();
 		local_irq_enable();
-		__schedule(true);
+		__schedule(SM_PREEMPT);
 		local_irq_disable();
 		sched_preempt_enable_no_resched();
 	} while (need_resched());
@@ -9803,23 +9838,137 @@ void sched_cancel_fork(struct task_struct *p)
 }
 
 /*
- * rt_mutex helpers. MuQSS has no proxy execution or sched_rt_mutex bookkeeping;
- * the pre/post hooks still have to run the worker submit/update pair so that
- * blocking on an rt_mutex flushes plugged IO the same way schedule() does.
+ * rt_mutex helpers. MuQSS has no proxy execution; pre/post still run the
+ * worker submit/update pair so blocking on an rt_mutex flushes plugged IO.
+ * rt_mutex_schedule() must not re-enter schedule() or submit_work runs twice.
  */
+#ifdef CONFIG_RT_MUTEXES
+#define fetch_and_set(x, v) ({ int _x = (x); (x) = (v); _x; })
+#endif
+
 void rt_mutex_pre_schedule(void)
 {
+#ifdef CONFIG_RT_MUTEXES
+	lockdep_assert(!fetch_and_set(current->sched_rt_mutex, 1));
+#endif
 	sched_submit_work(current);
 }
 
 void rt_mutex_schedule(void)
 {
-	schedule();
+#ifdef CONFIG_RT_MUTEXES
+	lockdep_assert(current->sched_rt_mutex);
+#endif
+	__schedule_loop(SM_NONE);
 }
 
 void rt_mutex_post_schedule(void)
 {
 	sched_update_worker(current);
+#ifdef CONFIG_RT_MUTEXES
+	lockdep_assert(fetch_and_set(current->sched_rt_mutex, 0));
+#endif
+}
+
+int dl_task_check_affinity(struct task_struct *p __always_unused,
+			   const struct cpumask *mask __always_unused)
+{
+	/* MuQSS has no deadline bandwidth admission. */
+	return 0;
+}
+
+#ifdef CONFIG_SMP
+static const struct cpumask *task_user_cpus(struct task_struct *p)
+{
+	if (!p->user_cpus_ptr)
+		return cpu_possible_mask;
+	return p->user_cpus_ptr;
+}
+
+/*
+ * Intersect the task's user-requested mask with @subset_mask and apply it.
+ * Empty intersection leaves affinity unchanged.
+ */
+static int restrict_cpus_allowed_ptr(struct task_struct *p,
+				     struct cpumask *new_mask,
+				     const struct cpumask *subset_mask)
+{
+	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask))
+		return -EINVAL;
+
+	return __set_cpus_allowed_ptr(p, new_mask, 0);
+}
+#endif
+
+/*
+ * Restrict @p to CPUs it can actually run on (task_cpu_possible_mask()).
+ * ARM64 32-bit execve uses this when 64-bit-only CPUs exist.
+ */
+void force_compatible_cpus_allowed_ptr(struct task_struct *p)
+{
+	const struct cpumask *override_mask = task_cpu_possible_mask(p);
+#ifdef CONFIG_SMP
+	cpumask_var_t new_mask;
+
+	alloc_cpumask_var(&new_mask, GFP_KERNEL);
+
+	/*
+	 * __migrate_task() can fail silently if the dest CPU is offlined
+	 * concurrently, so hold the hotplug lock across the move.
+	 */
+	cpus_read_lock();
+	if (!cpumask_available(new_mask))
+		goto out_set_mask;
+
+	if (!restrict_cpus_allowed_ptr(p, new_mask, override_mask))
+		goto out_free_mask;
+
+	cpuset_cpus_allowed(p, new_mask);
+	override_mask = new_mask;
+
+out_set_mask:
+	if (printk_ratelimit()) {
+		printk_deferred("Overriding affinity for process %d (%s) to CPUs %*pbl\n",
+				task_pid_nr(p), p->comm,
+				cpumask_pr_args(override_mask));
+	}
+
+	WARN_ON(set_cpus_allowed_ptr(p, override_mask));
+out_free_mask:
+	cpus_read_unlock();
+	free_cpumask_var(new_mask);
+#else
+	WARN_ON(set_cpus_allowed_ptr(p, override_mask));
+#endif
+}
+
+/*
+ * Restore the affinity previously restricted by
+ * force_compatible_cpus_allowed_ptr(). Caller serialises the pair.
+ */
+void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
+{
+#ifdef CONFIG_SMP
+	cpumask_var_t cpus_allowed, new_mask;
+	int ret = -ENOMEM;
+
+	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL))
+		goto warn;
+	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
+		goto out_free_cpus_allowed;
+
+	cpuset_cpus_allowed(p, cpus_allowed);
+	cpumask_and(new_mask, task_user_cpus(p), cpus_allowed);
+	ret = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK);
+
+	free_cpumask_var(new_mask);
+out_free_cpus_allowed:
+	free_cpumask_var(cpus_allowed);
+warn:
+	WARN_ON_ONCE(ret);
+#else
+	WARN_ON(set_cpus_allowed_ptr(p, cpu_possible_mask));
+#endif
 }
 
 const char *preempt_model_str(void)
