@@ -1750,8 +1750,18 @@ static inline bool sched_other_cpu(struct task_struct *p, int cpu)
 {
 	if (unlikely(is_migration_disabled(p) && task_cpu(p) != cpu))
 		return true;
-	if (likely(cpumask_test_cpu(cpu, p->cpus_ptr)))
+	if (likely(cpumask_test_cpu(cpu, p->cpus_ptr))) {
+		/*
+		 * Userspace must not be picked on a deactivated CPU.
+		 * Kernel threads (the hotplug thread, per-CPU kthreads)
+		 * and a migrate_disable() pin on this CPU still may.
+		 */
+		if (unlikely(!cpu_active(cpu)) &&
+		    !(p->flags & PF_KTHREAD) &&
+		    !is_migration_disabled(p))
+			return true;
 		return false;
+	}
 	if (p->nr_cpus_allowed == 1) {
 		cpumask_t valid_mask;
 
@@ -1766,9 +1776,12 @@ static inline bool needs_other_cpu(struct task_struct *p, int cpu)
 {
 	if (unlikely(is_migration_disabled(p)))
 		return task_cpu(p) != cpu;
-	if (cpumask_test_cpu(cpu, p->cpus_ptr))
-		return false;
-	return true;
+	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+		return true;
+	/* Mirror is_cpu_allowed(): userspace cannot be placed on !active. */
+	if (unlikely(!cpu_active(cpu)) && !(p->flags & PF_KTHREAD))
+		return true;
+	return false;
 }
 
 /*
@@ -7665,45 +7678,93 @@ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
 
 #ifdef CONFIG_HOTPLUG_CPU
 /*
- * Run through task list and find tasks affined to the dead cpu, then remove
- * that cpu from the list, enable cpu0 and set the zerobound flag. Must hold
- * cpu 0 and src_cpu's runqueue locks. We should be holding both rq lock and
- * pi_lock to change cpus_mask but it's not going to matter here.
+ * Skip affinity rewrite for tasks whose mask is managed elsewhere: the
+ * hotplug/stopper threads, idle, and kthreads that forbid setaffinity
+ * (including KTHREAD_IS_PER_CPU, rebound on unpark).
+ */
+static bool bind_zero_skip_affinity(struct task_struct *p, struct rq *rq)
+{
+	return p == current || is_idle_task(p) || p == rq->stop ||
+	       (p->flags & PF_NO_SETAFFINITY) || kthread_is_per_cpu(p);
+}
+
+/*
+ * Drop @src_cpu from @p's allowed mask under pi+rq lock. If that leaves
+ * no active CPU, pin the task to an active fallback (usually CPU0) and
+ * remember it with zerobound so unbind_zero() can restore the CPU when
+ * it comes back. Queued tasks still sitting on @src_cpu are moved.
+ *
+ * migrate_disable() tasks keep their pin (cpus_ptr) and are left for
+ * wait_empty to wait out; only cpus_mask is updated so migrate_enable()
+ * will affine_move them.
+ */
+static int bind_zero_one(struct task_struct *p, int src_cpu)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+	cpumask_t new_mask;
+	int dest, bound = 0;
+
+	rq = task_rq_lock(p, &rf);
+
+	if (!bind_zero_skip_affinity(p, rq) &&
+	    cpumask_test_cpu(src_cpu, &p->cpus_mask)) {
+		cpumask_copy(&new_mask, &p->cpus_mask);
+		cpumask_clear_cpu(src_cpu, &new_mask);
+		if (!cpumask_intersects(&new_mask, cpu_active_mask)) {
+			dest = cpumask_any(cpu_active_mask);
+			if (dest >= nr_cpu_ids)
+				dest = cpumask_any(cpu_online_mask);
+			if (dest < nr_cpu_ids) {
+				cpumask_set_cpu(dest, &new_mask);
+				p->zerobound = true;
+			}
+		}
+		if (!cpumask_empty(&new_mask)) {
+			struct affinity_context ac = { .new_mask = &new_mask };
+
+			__do_set_cpus_allowed(p, &ac);
+			bound = 1;
+		}
+	}
+
+	if (task_cpu(p) == src_cpu && p != current &&
+	    !is_idle_task(p) && p != rq->stop &&
+	    !is_migration_disabled(p)) {
+		dest = valid_task_cpu(p);
+		if (dest != src_cpu) {
+			if (task_queued(p))
+				rq = move_queued_task(rq, &rf, p, dest);
+			else if (!task_running(rq, p))
+				p->wake_cpu = dest;
+		}
+	}
+
+	task_rq_unlock(rq, p, &rf);
+	return bound;
+}
+
+/*
+ * Called from sched_cpu_wait_empty() (sleepable) on the outgoing CPU.
+ * Walk every task, rewrite affinity, and move anyone still queued here.
  */
 static void bind_zero(int src_cpu)
 {
-	struct task_struct *p, *t;
-	struct rq *rq0;
+	struct task_struct *g, *p;
 	int bound = 0;
 
 	if (src_cpu == 0)
 		return;
 
-	rq0 = cpu_rq(0);
-
-	for_each_process_thread(t, p) {
-		if (cpumask_test_cpu(src_cpu, p->cpus_ptr)) {
-			bool local = (task_cpu(p) == src_cpu);
-			struct rq *rq = task_rq(p);
-
-			/* task_running is the cpu stopper thread */
-			if (local && task_running(rq, p))
-				continue;
-			atomic_clear_cpu(src_cpu, &p->cpus_mask);
-			atomic_set_cpu(0, &p->cpus_mask);
-			p->zerobound = true;
-			bound++;
-			if (local) {
-				bool queued = task_queued(p);
-
-				if (queued)
-					dequeue_task(rq, p, 0);
-				set_task_cpu(p, 0);
-				if (queued)
-					enqueue_task(rq0, p, ENQUEUE_MIGRATED);
-			}
-		}
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		if (task_cpu(p) != src_cpu &&
+		    !cpumask_test_cpu(src_cpu, p->cpus_ptr) &&
+		    !cpumask_test_cpu(src_cpu, &p->cpus_mask))
+			continue;
+		bound += bind_zero_one(p, src_cpu);
 	}
+	rcu_read_unlock();
 
 	if (bound) {
 		printk(KERN_INFO "MuQSS removed affinity for %d processes to cpu %d\n",
@@ -7711,38 +7772,53 @@ static void bind_zero(int src_cpu)
 	}
 }
 
-/* Find processes with the zerobound flag and reenable their affinity for the
- * CPU coming alive. */
+/*
+ * Restore @src_cpu to tasks that bind_zero() had to force onto a
+ * fallback. Hold pi+rq so cpus_mask / nr_cpus_allowed stay in lockstep.
+ * Unbound kthreads are eligible — only per-CPU / PF_NO_SETAFFINITY
+ * threads were skipped on the way out.
+ */
 static void unbind_zero(int src_cpu)
 {
-	int unbound = 0, zerobound = 0;
-	struct task_struct *p, *t;
+	int unbound = 0, released = 0;
+	struct task_struct *g, *p;
 
 	if (src_cpu == 0)
 		return;
 
-	for_each_process_thread(t, p) {
-		if (!p->mm)
-			p->zerobound = false;
-		if (p->zerobound) {
-			unbound++;
-			cpumask_set_cpu(src_cpu, &p->cpus_mask);
-			/* Once every CPU affinity has been re-enabled, remove
-			 * the zerobound flag */
-			if (cpumask_subset(cpu_possible_mask, p->cpus_ptr)) {
-				p->zerobound = false;
-				zerobound++;
-			}
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		struct rq_flags rf;
+		struct rq *rq;
+
+		if (!p->zerobound)
+			continue;
+
+		rq = task_rq_lock(p, &rf);
+		if (!p->zerobound) {
+			task_rq_unlock(rq, p, &rf);
+			continue;
 		}
+		if (!cpumask_test_cpu(src_cpu, &p->cpus_mask)) {
+			cpumask_set_cpu(src_cpu, &p->cpus_mask);
+			p->nr_cpus_allowed = cpumask_weight(&p->cpus_mask);
+			unbound++;
+		}
+		if (cpumask_subset(cpu_possible_mask, &p->cpus_mask)) {
+			p->zerobound = false;
+			released++;
+		}
+		task_rq_unlock(rq, p, &rf);
 	}
+	rcu_read_unlock();
 
 	if (unbound) {
 		printk(KERN_INFO "MuQSS added affinity for %d processes to cpu %d\n",
 		       unbound, src_cpu);
 	}
-	if (zerobound) {
+	if (released) {
 		printk(KERN_INFO "MuQSS released forced binding to cpu0 for %d processes\n",
-		       zerobound);
+		       released);
 	}
 }
 
@@ -8063,8 +8139,12 @@ int sched_cpu_activate(unsigned int cpu)
 		BUG_ON(!cpumask_test_cpu(cpu, rq->rd->span));
 		set_rq_online(rq);
 	}
-	unbind_zero(cpu);
 	rq_unlock_irqrestore(rq, &rf);
+	/*
+	 * unbind_zero() takes each task's pi+rq lock; do not nest that
+	 * under this CPU's rq lock.
+	 */
+	unbind_zero(cpu);
 
 	return 0;
 }
@@ -8152,8 +8232,44 @@ static void sched_force_init_mm(void)
 	local_irq_restore(flags);
 }
 
-int sched_cpu_wait_empty(unsigned int __always_unused cpu)
+static void dump_rq_tasks(struct rq *rq, const char *loglvl)
 {
+	struct task_struct *g, *p;
+	int cpu = cpu_of(rq);
+
+	lockdep_assert_rq_held(rq);
+
+	printk("%sCPU%d tasks (nr_running=%u nr_pinned=%u):\n",
+	       loglvl, cpu, rq->nr_running, rq->nr_pinned);
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		if (task_cpu(p) != cpu)
+			continue;
+		printk("%s\tpid: %d, name: %s, queued: %d, on_rq: %d\n",
+		       loglvl, p->pid, p->comm, task_queued(p), p->on_rq);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Invoked on the outgoing CPU after per-CPU kthreads have been parked.
+ * bind_zero() takes affinity off this CPU and moves anyone still queued
+ * here. Then wait until only this hotplug thread remains and every
+ * migrate_disable() pin has dropped, so finish_cpu() cannot see a user mm.
+ */
+int sched_cpu_wait_empty(unsigned int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	WARN_ON_ONCE(cpu != smp_processor_id());
+
+	for (;;) {
+		bind_zero(cpu);
+		if (READ_ONCE(rq->nr_running) <= 1 && !READ_ONCE(rq->nr_pinned))
+			break;
+		schedule_timeout_uninterruptible(1);
+	}
+
 	sched_force_init_mm();
 	return 0;
 }
@@ -8161,31 +8277,33 @@ int sched_cpu_wait_empty(unsigned int __always_unused cpu)
 int sched_cpu_dying(unsigned int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
-	unsigned long flags;
+	struct rq_flags rf;
 
-	/* Handle pending wakeups and then migrate everything off */
+	/* Handle pending wakeups; tasks were already moved in wait_empty. */
 	sched_tick_stop(cpu);
 
-	local_irq_save(flags);
-	double_rq_lock(rq, cpu_rq(0));
+	rq_lock_irqsave(rq, &rf);
 	if (rq->rd) {
 		BUG_ON(!cpumask_test_cpu(cpu, rq->rd->span));
 		set_rq_offline(rq);
 	}
-	bind_zero(cpu);
-	double_rq_unlock(rq, cpu_rq(0));
+	if (rq->nr_running > 1 || rq->nr_pinned) {
+		WARN(true, "Dying CPU not properly vacated!");
+		dump_rq_tasks(rq, KERN_WARNING);
+	}
+	rq_unlock_irqrestore(rq, &rf);
+
 	sched_start_tick(rq, cpu);
 	hrexpiry_clear(rq);
 	/*
-	 * Unlike mainline, MuQSS does not push tasks off a deactivated CPU
-	 * until bind_zero() above, so a user task may have run here after
-	 * sched_cpu_wait_empty() already switched the hotplug thread to
-	 * init_mm.  Drop the lazy mm again now that this is the last thing to
-	 * run before idle takes over, or the idle task carries a user mm into
-	 * finish_cpu(), which warns and drops a reference that is not ours.
+	 * Belt-and-suspenders: wait_empty already switched to init_mm,
+	 * but a preempting migrate_disable() task could have left a
+	 * lazy user mm on current. Drop it again now that this is the
+	 * last thing to run before idle takes over.
 	 */
+	local_irq_disable();
 	__sched_force_init_mm();
-	local_irq_restore(flags);
+	local_irq_enable();
 
 	return 0;
 }
