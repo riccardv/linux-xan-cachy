@@ -61,6 +61,7 @@
 #include <linux/completion.h>
 #include <linux/hrtimer_rearm.h>
 #include <linux/livepatch_sched.h>
+#include <linux/muqss_iotime.h>
 #include <linux/smp.h>
 
 #include <asm/irq_regs.h>
@@ -170,6 +171,28 @@ int sched_iso_cpu __read_mostly = 70;
  * 2: Expire timeslice and recalculate deadline.
  */
 int sched_yield_type __read_mostly = 1;
+
+#ifdef CONFIG_MUQSS_IOTIME
+/*
+ * sched_iotime_scale - how hard to charge a task for the block device time
+ * spent on its behalf, as a percentage of that time. The charge is added to
+ * the task's virtual deadline, so it is a demotion, not a boost: a task that
+ * keeps a device busy for everybody else stops getting full CPU priority for
+ * free.
+ *
+ * 0 disables charging entirely, leaving accounting in place for observation.
+ * 100, the default, charges a task one nanosecond of deadline for each
+ * nanosecond of device time it consumed. That one to one rate is the only
+ * ratio with a meaning of its own: it says device time and CPU time cost a
+ * task the same, which is the whole premise of the feature. Values above 100
+ * weight I/O more heavily than CPU and are for experiment.
+ *
+ * The charge is capped at longest_deadline_diff(), so however large the debt
+ * a task can never be demoted past the lowest priority. See
+ * MuQSS-iotime-design.md.
+ */
+int sched_iotime_scale __read_mostly = 100;
+#endif
 
 /*
  * The relative length of deadline for each priority(nice) level.
@@ -749,6 +772,43 @@ static inline int ms_longest_deadline_diff(void)
 	return NS_TO_MS(longest_deadline_diff());
 }
 
+#ifdef CONFIG_MUQSS_IOTIME
+/*
+ * Take the block device time accumulated on this task's behalf since it was
+ * last charged, and convert it to an amount of virtual deadline to push the
+ * task back by. The debt is consumed as it is read, so each nanosecond of
+ * device time demotes the task exactly once no matter which caller gets to it
+ * first.
+ *
+ * This has to be consumed from both time_slice_expired() and enqueue_task().
+ * Expiry alone misses the streaming reader, which blocks before exhausting its
+ * slice and so never refreshes its deadline. Enqueue alone is not enough
+ * either: time_slice_expired() assigns the deadline absolutely, resetting the
+ * task to an uncharged baseline, and two of its callers (sched_yield() and
+ * yield_to()) have no enqueue behind them to reapply the charge.
+ */
+static inline u64 consume_iotime_penalty(struct task_struct *p)
+{
+	u64 debt, penalty;
+
+	if (!sched_iotime_scale)
+		return 0;
+
+	debt = atomic64_xchg(&p->io_debt_ns, 0);
+	if (!debt)
+		return 0;
+
+	penalty = debt * sched_iotime_scale / 100;
+
+	return penalty;
+}
+#else
+static inline u64 consume_iotime_penalty(struct task_struct *p)
+{
+	return 0;
+}
+#endif
+
 static inline bool rq_local(struct rq *rq);
 
 #ifndef SCHED_CAPACITY_SCALE
@@ -905,7 +965,7 @@ static inline void rt_running_reprio(struct rq *rq, int oldprio, int newprio)
 static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	unsigned int randseed, cflags = 0;
-	u64 sl_id;
+	u64 sl_id, penalty;
 
 	if (!rt_task(p)) {
 		/* Check it hasn't gotten rt from PI */
@@ -928,9 +988,18 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * from priority 0 realtime in first place to the lowest priority
 	 * idleprio tasks last. Skiplist insertion is an O(log n) process.
 	 */
+	/*
+	 * Charge for device time consumed since this task was last queued.
+	 * Consumed unconditionally so debt cannot accumulate while a task is
+	 * realtime, but only applied below, since realtime and iso tasks sort
+	 * by priority rather than by deadline and so are never demoted.
+	 */
+	penalty = consume_iotime_penalty(p);
+
 	if (p->prio <= ISO_PRIO) {
 		sl_id = p->prio;
 	} else {
+		p->deadline += penalty;
 		sl_id = p->deadline;
 		if (idleprio_task(p)) {
 			if (p->prio == IDLE_PRIO)
@@ -2575,6 +2644,9 @@ int sched_fork(u64 __maybe_unused clone_flags, struct task_struct *p)
 #ifdef CONFIG_SMP
 	p->wake_entry.u_flags = CSD_TYPE_TTWU;
 #endif
+	/* A new task starts with no I/O history of its own. */
+	muqss_iotime_task_init(p);
+
 	/*
 	 * We mark the process as NEW here. This guarantees that
 	 * nobody will actually run it, and a signal or other external
@@ -2752,6 +2824,17 @@ static const struct ctl_table muqss_sysctls[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE_HUNDRED,
 	},
+#ifdef CONFIG_MUQSS_IOTIME
+	{
+		.procname	= "iotime_scale",
+		.data		= &sched_iotime_scale,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE_THOUSAND,
+	},
+#endif
 	{
 		.procname	= "yield_type",
 		.data		= &sched_yield_type,
@@ -4346,7 +4429,13 @@ static inline unsigned long get_preempt_disable_ip(struct task_struct *p)
 static void time_slice_expired(struct task_struct *p, struct rq *rq)
 {
 	p->time_slice = timeslice();
-	p->deadline = rq->niffies + task_deadline_diff(p);
+	/*
+	 * This assignment is absolute, so the iotime charge has to be folded
+	 * in here rather than left to enqueue_task(), or expiry would reset
+	 * the task to an uncharged baseline.
+	 */
+	p->deadline = rq->niffies + task_deadline_diff(p) +
+		      consume_iotime_penalty(p);
 #ifdef CONFIG_SMT_NICE
 	if (!p->mm)
 		p->smt_bias = 0;
