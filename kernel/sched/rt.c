@@ -6,6 +6,7 @@
 
 #include "sched.h"
 #include "pelt.h"
+#include "infinity_sched.h"
 
 int sched_rr_timeslice = RR_TIMESLICE;
 /* More than 4 hours if BW_SHIFT equals 20. */
@@ -983,6 +984,11 @@ static void update_curr_rt(struct rq *rq)
 	if (unlikely(delta_exec <= 0))
 		return;
 
+	/* Infinity: RT EMA climbs with runtime for adaptive RR timeslice */
+	infinity_rt_consume(&donor->infinity, delta_exec);
+
+
+
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct sched_rt_entity *rt_se = &donor->rt;
 
@@ -1437,8 +1443,18 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
 
-	if (flags & ENQUEUE_WAKEUP)
+	if (flags & ENQUEUE_WAKEUP) {
 		rt_se->timeout = 0;
+
+		/* Infinity: RR EMA decay on wakeup for adaptive timeslice */
+		if (READ_ONCE(p->infinity.rt_last_sleep_ns)) {
+			u64 now = rq_clock(rq);
+
+			if (now > READ_ONCE(p->infinity.rt_last_sleep_ns))
+				infinity_rt_wakeup(&p->infinity,
+					now - READ_ONCE(p->infinity.rt_last_sleep_ns));
+		}
+	}
 
 	check_schedstat_required();
 	update_stats_wait_start_rt(rt_rq_of_se(rt_se), rt_se);
@@ -1458,6 +1474,10 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	update_curr_rt(rq);
 	dequeue_rt_entity(rt_se, flags);
+
+	/* Infinity: record sleep timestamp for RR EMA decay */
+	if ((flags & DEQUEUE_SLEEP) && p)
+		WRITE_ONCE(p->infinity.rt_last_sleep_ns, rq_clock(rq));
 
 	dequeue_pushable_task(rq, p);
 
@@ -2540,6 +2560,52 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 
 	watchdog(rq, p);
 
+	/* Infinity: force a rogue SCHED_FIFO (>95% rt_ema) to yield natively
+	 * within the RT class -- no cross-class demotion needed.  Kernel
+	 * threads (migration, watchdog, IRQ handlers) are exempt.
+	 * Hysteresis: engage >= 95%, re-arm only after rt_ema drops below
+	 * 85% (INFINITY_RT_REARM_THRESHOLD).  Rate limit: at most one
+	 * requeue per INFINITY_RT_REQUEUE_MS while engaged; the window is
+	 * jiffies-based because task_tick_rt() may run on a remote CPU
+	 * under NO_HZ_FULL tick offload (jiffies is global).  The rate
+	 * limit gates both requeue_task_rt() and resched_curr().  On the
+	 * forced requeue, rt_ema is decayed by a fixed synthetic sleep so
+	 * the release threshold is actually reachable for a continuously
+	 * running rogue FIFO (rt_ema otherwise climbs only on consume and
+	 * decays only on wakeup).
+	 *
+	 * Lone-FIFO limitation: native requeue can only yield to
+	 * same-priority competitors; for a FIFO that is alone at its
+	 * priority level the requeue is a no-op by RT semantics (no
+	 * cross-class demotion by design).  The valve still rate-limits
+	 * and drives the synthetic decay, and the tickless fold (see
+	 * infinity_rt_consume) keeps the EMA meaningful when ticks are
+	 * stopped, so a later same-priority arrival is granted the
+	 * re-armed window it deserves.
+	 */
+	if (p->policy != SCHED_RR && !(p->flags & PF_KTHREAD)) {
+		if (READ_ONCE(p->infinity.rt_ema) >= INFINITY_RT_DEMOTE_THRESHOLD) {
+			if (!READ_ONCE(p->infinity.rt_valve_armed) ||
+			    time_after_eq(jiffies,
+					  READ_ONCE(p->infinity.rt_valve_last_jiffies) +
+					  msecs_to_jiffies(INFINITY_RT_REQUEUE_MS))) {
+				WRITE_ONCE(p->infinity.rt_valve_armed, true);
+				WRITE_ONCE(p->infinity.rt_valve_last_jiffies, jiffies);
+				requeue_task_rt(rq, p, 0);
+				resched_curr(rq);
+				atomic64_inc(this_cpu_ptr(&infinity_rt_throttle_count));
+				infinity_rt_wakeup(&p->infinity,
+						   INFINITY_RT_REQUEUE_DECAY_NS);
+			}
+			return;
+		}
+		if (READ_ONCE(p->infinity.rt_valve_armed) &&
+		    READ_ONCE(p->infinity.rt_ema) < INFINITY_RT_REARM_THRESHOLD) {
+			WRITE_ONCE(p->infinity.rt_valve_armed, false);
+			WRITE_ONCE(p->infinity.rt_valve_last_jiffies, 0);
+		}
+	}
+
 	/*
 	 * RR tasks need a special form of time-slice management.
 	 * FIFO tasks have no timeslices.
@@ -2550,7 +2616,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	if (--p->rt.time_slice)
 		return;
 
-	p->rt.time_slice = sched_rr_timeslice;
+	p->rt.time_slice = infinity_rr_timeslice(p, sched_rr_timeslice);
 
 	/*
 	 * Requeue to the end of queue if we (and all of our ancestors) are not
@@ -2571,7 +2637,7 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 	 * Time slice is 0 for SCHED_FIFO tasks
 	 */
 	if (task->policy == SCHED_RR)
-		return sched_rr_timeslice;
+		return infinity_rr_timeslice(task, sched_rr_timeslice);
 	else
 		return 0;
 }

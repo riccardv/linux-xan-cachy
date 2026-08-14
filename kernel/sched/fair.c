@@ -55,8 +55,28 @@
 #include <uapi/linux/sched/types.h>
 
 #include "sched.h"
-#include "stats.h"
-#include "autogroup.h"
+#include "pelt.h"
+#include "infinity_sched.h"
+
+static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+			    unsigned long weight);
+
+/* Infinity: update EEVDF weight from EMA */
+static void infinity_update_weight(struct cfs_rq *cfs_rq,
+				   struct sched_entity *se,
+				   struct task_struct *p)
+{
+	u64 ema;
+	u32 new_weight;
+
+	ema = READ_ONCE(p->infinity.ema);
+	if (ema > INFINITY_BUDGET_MAX_NS)
+		ema = INFINITY_BUDGET_MAX_NS;
+	new_weight = infinity_calc_weight(p, ema);
+
+	if (new_weight != se->load.weight)
+		reweight_entity(cfs_rq, se, new_weight);
+}
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -1244,9 +1264,42 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * For EEVDF the virtual time slope is determined by w_i (iow.
 	 * nice) while the request time r_i is determined by
 	 * sysctl_sched_base_slice.
+	 *
+	 * Infinity: the task's EEVDF weight is modulated by EMA
+	 * (via infinity_update_weight).  A lower weight gives EEVDF
+	 * a shorter slice and later deadline naturally -- no slice
+	 * manipulation needed beyond optional SMT halving.
 	 */
-	if (!se->custom_slice)
+	if (!se->custom_slice) {
 		se->slice = sysctl_sched_base_slice;
+
+		if (entity_is_task(se)) {
+			struct task_struct *p__ = task_of(se);
+
+			/*
+			 * SMT halving: on the secondary SMT thread,
+			 * reduce the slice further.
+			 */
+#ifdef CONFIG_SCHED_SMT
+			{
+				int cpu = cpu_of(rq_of(cfs_rq));
+				const struct cpumask *sibling_mask =
+					topology_sibling_cpumask(cpu);
+				if (sibling_mask && !cpumask_empty(sibling_mask) &&
+				    cpu != cpumask_first(sibling_mask)) {
+					unsigned long div = READ_ONCE(
+						infinity_tune_smt_divisor);
+					if (div > 1)
+						se->slice = div64_u64(
+							se->slice, div);
+				}
+			}
+#endif
+
+			/* Update EEVDF weight from EMA */
+			infinity_update_weight(cfs_rq, se, p__);
+		}
+	}
 
 	/*
 	 * EEVDF: vd_i = ve_i + r_i / w_i
@@ -1423,6 +1476,47 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	delta_exec = update_se(rq, curr);
 	if (unlikely(delta_exec <= 0))
 		return;
+
+	/* Infinity: EMA budget consumption with adaptive alpha */
+	if (entity_is_task(curr)) {
+		struct task_struct *p__ = task_of(curr);
+
+		infinity_consume(&p__->infinity, delta_exec,
+				 rq_of(cfs_rq)->cpu_capacity);
+	} else {
+		/* Group entity: climb group_ema for cgroup defense */
+		struct cfs_rq *gcfs_rq = group_cfs_rq(curr);
+
+		if (gcfs_rq) {
+			u64 delta = delta_exec;
+
+			if (delta > INFINITY_CGROUP_EMA_CLIMB_NS)
+				delta = INFINITY_CGROUP_EMA_CLIMB_NS;
+			u64 old = gcfs_rq->group_ema;
+			gcfs_rq->group_ema += div64_u64(
+				(INFINITY_CGROUP_EMA_CLIMB_NS - gcfs_rq->group_ema) *
+				delta * INFINITY_CGROUP_EMA_ALPHA,
+				INFINITY_CGROUP_EMA_CLIMB_NS * INFINITY_FP_ONE);
+			/* Infinity: the climb is saturating at INFINITY_CGROUP_EMA_CLIMB_NS;
+			 * a regression here indicates wraparound/corruption.
+			 */
+			WARN_ON_ONCE(gcfs_rq->group_ema < old);
+#ifdef CONFIG_FAIR_GROUP_SCHED
+			/* Shield v2: publish the new high-water mark upward only
+			 * (no contention: most ticks find local <= max and take one
+			 * READ_ONCE + compare).
+			 */
+			{
+				struct task_group *tg = gcfs_rq->tg;
+				u64 max = READ_ONCE(tg->infinity_shield.shield_ema_max);
+
+				if (gcfs_rq->group_ema > max)
+					WRITE_ONCE(tg->infinity_shield.shield_ema_max,
+						   gcfs_rq->group_ema);
+			}
+#endif
+		}
+	}
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
 	resched = update_deadline(cfs_rq, curr);
@@ -4244,6 +4338,7 @@ static void update_cfs_group(struct sched_entity *se)
 {
 	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
 	long shares;
+	bool shield_reduced = false;
 
 	/*
 	 * When a group becomes empty, preserve its weight. This matters for
@@ -4253,8 +4348,86 @@ static void update_cfs_group(struct sched_entity *se)
 		return;
 
 	shares = calc_group_shares(gcfs_rq);
-	if (unlikely(se->load.weight != shares))
+
+	/* Infinity: shield v2 -- bounded cross-CPU max recompute.
+	 * At most once per INFINITY_SHIELD_RESCAN_MS per task_group.
+	 * Safe without hotplug locks: always runs under rq->lock with
+	 * preemption disabled, so no RCU grace period can elapse and
+	 * tg->cfs_rq[] (allocated for all possible CPUs, freed only with
+	 * the tg) stays valid.  cpus_read_lock() is forbidden here: hotplug
+	 * holds cpus_write_lock and then takes rq locks, so a reader blocked
+	 * behind the writer while holding rq->lock would AB-BA deadlock.
+	 * Offline CPUs are skipped via cpu_online() -- their group_ema is
+	 * frozen (no ticks/decay on a dead CPU) and a permanently high
+	 * offline value would otherwise lock the shield ON; skipping them
+	 * bounds a stuck max to one rescan window.  cpu_online() is a
+	 * racy-but-benign bit test: a stale read self-corrects on the next
+	 * scan (<= 8ms).
+	 */
+	{
+		struct task_group *tg = gcfs_rq->tg;
+
+		if (READ_ONCE(tg->infinity_shield.shield_ema_max_stale) &&
+		    time_after(jiffies, tg->infinity_shield.shield_last_scan_jiffies +
+					msecs_to_jiffies(INFINITY_SHIELD_RESCAN_MS))) {
+			u64 max = 0;
+			int i;
+
+			for_each_possible_cpu(i) {
+				struct cfs_rq *crq = tg->cfs_rq[i];
+
+				if (!cpu_online(i))
+					continue;
+				if (READ_ONCE(crq->group_ema) > max)
+					max = READ_ONCE(crq->group_ema);
+			}
+			WRITE_ONCE(tg->infinity_shield.shield_ema_max, max);
+			WRITE_ONCE(tg->infinity_shield.shield_ema_max_stale, false);
+			WRITE_ONCE(tg->infinity_shield.shield_last_scan_jiffies, jiffies);
+		}
+	}
+
+	/* Infinity: shield v2 -- quantized ramp.  Engage decision from
+	 * the tg-wide max (any CPU hammering => engage), ramp amount from
+	 * the LOCAL cfs_rq EMA only (a quiet CPU computes red == 0 and
+	 * never reweights -- no oscillation).
+	 */
+	if (READ_ONCE(gcfs_rq->tg->infinity_shield.shield_ema_max) >=
+	    INFINITY_SHIELD_ENGAGE_THRESHOLD_NS) {
+		u64 ema_pct = div64_u64(gcfs_rq->group_ema * 100ULL,
+					INFINITY_CGROUP_EMA_CLIMB_NS);
+
+		if (ema_pct >= INFINITY_SHIELD_ENGAGE_PCT) {
+			u64 red = div64_u64((ema_pct - INFINITY_SHIELD_ENGAGE_PCT) *
+					    INFINITY_SHIELD_MAX_REDUCE_PCT,
+					    100ULL - INFINITY_SHIELD_ENGAGE_PCT);
+			/* quantize DOWN to steps of INFINITY_SHIELD_STEP_PCT:
+			 * reweight_entity() fires at most once per bucket
+			 * crossing, never per tick
+			 */
+			red = (red / INFINITY_SHIELD_STEP_PCT) *
+			      INFINITY_SHIELD_STEP_PCT;
+
+			if (red) {
+				long reduced = shares * (100ULL - red) / 100ULL;
+
+				shares = max_t(long, reduced, MIN_SHARES);
+				shield_reduced = true;
+			}
+		}
+	}
+
+	if (unlikely(se->load.weight != shares)) {
 		reweight_entity(cfs_rq_of(se), se, shares);
+		/* Infinity: the shield counter counts only shield-induced
+		 * reweights that actually changed the group share.  It
+		 * previously incremented on every update_cfs_group()
+		 * evaluation (per tick via entity_tick), overstating
+		 * applied reductions by ~3 orders of magnitude.
+		 */
+		if (shield_reduced)
+			atomic64_inc(this_cpu_ptr(&infinity_shield_engage_count));
+	}
 }
 
 #else /* !CONFIG_FAIR_GROUP_SCHED: */
@@ -5497,6 +5670,45 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		vslice /= 2;
 
 	/*
+	 * Infinity: when a task wakes from a futex (futex_waiting is true),
+	 * halve its vslice so it gets an earlier deadline and runs sooner,
+	 * reducing IPC wakeup latency.
+	 */
+	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
+	    READ_ONCE(task_of(se)->infinity.futex_waiting)) {
+		vslice >>= 1;
+		atomic64_inc(this_cpu_ptr(&infinity_futex_boost_count));
+	}
+
+	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
+	    READ_ONCE(task_of(se)->infinity.ipc_waiting) &&
+	    !(task_of(se)->flags & PF_KTHREAD)) {
+		/* Infinity: IPC candidates -- all wait_woken wakeups. */
+		u64 now = rq_clock(rq_of(cfs_rq));
+		u64 last_boost = READ_ONCE(task_of(se)->infinity.ipc_last_boost);
+
+		atomic64_inc(this_cpu_ptr(&infinity_ipc_wakeup_count));
+		if (!last_boost ||
+		    (now > last_boost &&
+		     now - last_boost >= INFINITY_IPC_RATE_LIMIT_NS)) {
+			/* IPC boost gradient -- full 2x at sleep <= 1ms,
+			 * linear falloff to 1x at >= 8ms.
+			 */
+			u64 last_sleep = READ_ONCE(task_of(se)->infinity.last_sleep_ns);
+			u64 sleep_ns = (last_sleep && now > last_sleep) ?
+				       now - last_sleep : 0;
+			u64 red = infinity_ipc_gradient(sleep_ns);
+
+			if (red) {
+				vslice -= (vslice * red) >> INFINITY_FP_SHIFT;
+				WRITE_ONCE(task_of(se)->infinity.ipc_last_boost,
+					   now);
+				atomic64_inc(this_cpu_ptr(&infinity_ipc_boost_count));
+			}
+		}
+	}
+
+	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
 	se->deadline = se->vruntime + vslice;
@@ -5780,6 +5992,17 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 	struct sched_entity *se;
 
 	se = pick_eevdf(cfs_rq, protect);
+	if (unlikely(!se)) {
+		/* pick_eevdf() legitimately returns NULL when every queued
+		 * entity is ineligible (protect path, tight-deadline windows
+		 * from the futex/IPC vslice reductions).  Falling back to the
+		 * leftmost queued entity keeps runnable tasks from being
+		 * skipped rather than idling.
+		 */
+		se = __pick_first_entity(cfs_rq);
+		if (!se)
+			return NULL;
+	}
 	if (se->sched_delayed) {
 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 		/*
@@ -5787,6 +6010,20 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 		 */
 		return NULL;
 	}
+	/*
+	 * Hint the cpufreq governor when an interactive task (zero EMA)
+	 * is picked, so it ramps frequency immediately rather than waiting
+	 * for PELT to accumulate.
+	 */
+	if (entity_is_task(se)) {
+		struct task_struct *p = task_of(se);
+
+		if (READ_ONCE(p->infinity.ema) == 0) {
+			cpufreq_update_util(rq, SCHED_CPUFREQ_INTERACTIVE);
+			atomic64_inc(this_cpu_ptr(&infinity_cpufreq_interactive_count));
+		}
+	}
+
 	return se;
 }
 
@@ -7195,14 +7432,82 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;
+
+	/* Infinity: EMA decay on wakeup */
+	if (flags & ENQUEUE_WAKEUP) {
+		u64 now = rq_clock(rq_of(task_cfs_rq(p)));
+		u64 last_sleep = READ_ONCE(p->infinity.last_sleep_ns);
+
+		if (last_sleep && now > last_sleep)
+			infinity_wakeup(&p->infinity, now - last_sleep);
+	}
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	/*
+	 * Group EMA decay: if this cfs_rq was idle (sleep_start set) and a
+	 * task is (re)entering, apply exponential decay using the elapsed
+	 * idle time.  Also covers ENQUEUE_MIGRATED so the idle window is
+	 * not deferred past the end of the idle period.
+	 */
+	if (flags & (ENQUEUE_WAKEUP | ENQUEUE_MIGRATED)) {
+		struct cfs_rq *pcfs_rq = cfs_rq_of(&p->se);
+
+		if (READ_ONCE(pcfs_rq->group_ema_sleep_start)) {
+			u64 now = rq_clock(rq_of(pcfs_rq));
+
+			/*
+			 * Infinity: group_ema stamps are rq_clock() taken under the
+			 * owning rq's lock (fresh at stamp time).  The arrival may be
+			 * on another rq after migration, so the delta is guarded: a
+			 * backward clock (broken TSC sync / cross-rq skew) retains
+			 * the EMA -- the safe direction, same pattern as the task
+			 * (fair.c) and RT paths.
+			 */
+			if (now > READ_ONCE(pcfs_rq->group_ema_sleep_start)) {
+				u64 old = READ_ONCE(pcfs_rq->group_ema);
+				u64 sleep_ns = now -
+					READ_ONCE(pcfs_rq->group_ema_sleep_start);
+				u64 periods = div64_u64(sleep_ns,
+							 INFINITY_CGROUP_EMA_HALFLIFE_NS);
+
+				if (periods > 63)
+					WRITE_ONCE(pcfs_rq->group_ema, 0);
+				else
+					WRITE_ONCE(pcfs_rq->group_ema,
+						   old >> periods);
+				/* Infinity: decay must never raise the EMA. */
+				WARN_ON_ONCE(READ_ONCE(pcfs_rq->group_ema) > old);
+			}
+			/* Shield v2: any decay may invalidate the tg-wide max; the
+			 * local rq cannot know it is the max-holder cheaply, so mark
+			 * stale and let the next update_cfs_group() scan (bounded,
+			 * see update_cfs_group) recompute.
+			 */
+			{
+				struct task_group *tg = pcfs_rq->tg;
+
+				if (READ_ONCE(tg->infinity_shield.shield_ema_max) > 0)
+					WRITE_ONCE(tg->infinity_shield.shield_ema_max_stale,
+						   true);
+			}
+			WRITE_ONCE(pcfs_rq->group_ema_sleep_start, 0);
+		}
+	}
+#endif
 	int h_nr_idle = task_has_idle_policy(p);
 	int h_nr_runnable = 1;
 	int task_new = !(flags & ENQUEUE_WAKEUP);
 	int rq_h_nr_queued = rq->cfs.h_nr_queued;
 	u64 slice = 0;
 
-	if (task_is_throttled(p) && enqueue_throttled_task(p))
+	if (task_is_throttled(p) && enqueue_throttled_task(p)) {
+		/* A wakeup that lands on a throttled cfs_rq does not reach
+		 * place_entity(); clear the wake flags so they cannot produce
+		 * a stale boost when the task is unthrottled later.
+		 */
+		WRITE_ONCE(p->infinity.futex_waiting, false);
+		WRITE_ONCE(p->infinity.ipc_waiting, false);
 		return;
+	}
 
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
@@ -7277,6 +7582,18 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
+	}
+
+	if (flags & ENQUEUE_WAKEUP) {
+		/* Check futex_waiting before clearing -- triggers freq ramp for IPC wakeups */
+		if (READ_ONCE(p->infinity.futex_waiting))
+			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
+
+		WRITE_ONCE(p->infinity.futex_waiting, false);
+		WRITE_ONCE(p->infinity.ipc_waiting, false);
+
+		if (p->in_iowait)
+			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
 	}
 
 	if (!rq_h_nr_queued && rq->cfs.h_nr_queued)
@@ -7427,6 +7744,10 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	/* Infinity: record sleep start */
+	if (flags & DEQUEUE_SLEEP)
+		WRITE_ONCE(p->infinity.last_sleep_ns, rq_clock(rq_of(task_cfs_rq(p))));
+
 	if (task_is_throttled(p)) {
 		dequeue_throttled_task(p, flags);
 		return true;
@@ -7435,8 +7756,42 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
+	/* Infinity: EMA vs PELT divergence diagnostic (observability only).
+	 * One compare per sleep; flags tasks whose EMA classification
+	 * (hog vs interactive) differs from PELT by > 50pp.  The flag is
+	 * raised only after INFINITY_DIVERGENCE_STREAK consecutive
+	 * divergent sleeps, so a transient single-burst noise is filtered
+	 * out and one counter bump is emitted per divergence episode.
+	 */
+	if (flags & DEQUEUE_SLEEP) {
+		u64 ema = READ_ONCE(p->infinity.ema);
+		unsigned long util = task_util_est(p);
+		u64 ema_units = mul_u64_u32_div(ema, SCHED_CAPACITY_SCALE,
+						INFINITY_BUDGET_MAX_NS);
+		u64 diff = ema_units > util ? ema_units - util : util - ema_units;
+
+		if (diff > INFINITY_DIVERGENCE_THRESHOLD_UNITS) {
+			p->infinity.divergence_streak++;
+			if (p->infinity.divergence_streak ==
+			    INFINITY_DIVERGENCE_STREAK)
+				atomic64_inc(this_cpu_ptr(&infinity_divergence_count));
+		} else {
+			p->infinity.divergence_streak = 0;
+		}
+	}
+
 	if (dequeue_entities(rq, &p->se, flags) < 0)
 		return false;
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	/*
+	 * nr_queued is now final (decremented inside dequeue_entity →
+	 * account_entity_dequeue). If this cfs_rq is empty, record idle
+	 * start so enqueue_task_fair can decay group_ema on next wakeup.
+	 */
+	if ((flags & DEQUEUE_SLEEP) && cfs_rq_of(&p->se)->nr_queued == 0)
+		WRITE_ONCE(cfs_rq_of(&p->se)->group_ema_sleep_start, rq_clock(rq));
+#endif
 
 	/*
 	 * Must not reference @p after dequeue_entities(DEQUEUE_DELAYED).
@@ -8850,6 +9205,54 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		    cpumask_test_cpu(cpu, p->cpus_ptr))
 			return cpu;
 
+		/*
+		 * Infinity: on asymmetric topologies (hybrid P/E cores),
+		 * bias interactive tasks (EMA == 0) toward the highest-
+		 * capacity P-cores.  This avoids placing latency-sensitive
+		 * tasks on E-cores during wakeup.
+		 *
+		 * Prefer a P-core on the task's home node (prev_cpu) to
+		 * preserve cache warmth and memory locality on multi-node
+		 * machines; fall back to any allowed P-core otherwise.
+		 *
+		 * Lockless read of p->infinity.ema: only p->pi_lock is held
+		 * here, not rq->lock.  READ_ONCE prevents compiler tearing
+		 * on 32-bit architectures.
+		 */
+		if (sched_asym_cpucap_active() && READ_ONCE(p->infinity.ema) == 0) {
+			struct asym_cap_data *entry;
+			int best_cpu = -1;
+			int home_node = cpu_to_node(prev_cpu);
+
+			rcu_read_lock();
+			list_for_each_entry_rcu(entry, &asym_cap_list, link) {
+				int cpu;
+
+				/*
+				 * First allowed CPU of this capacity group,
+				 * kept as fallback (list is highest-capacity
+				 * first).
+				 */
+				cpu = cpumask_first_and(cpu_capacity_span(entry),
+							p->cpus_ptr);
+				if (cpu < nr_cpu_ids && best_cpu < 0)
+					best_cpu = cpu;
+
+				/* Prefer a P-core on the task's home node. */
+				for_each_cpu_and(cpu, cpu_capacity_span(entry),
+						 p->cpus_ptr) {
+					if (cpu_to_node(cpu) == home_node) {
+						rcu_read_unlock();
+						return cpu;
+					}
+				}
+			}
+			rcu_read_unlock();
+
+			if (best_cpu >= 0)
+				return best_cpu;
+		}
+
 		if (!is_rd_overutilized(this_rq()->rd)) {
 			new_cpu = find_energy_efficient_cpu(p, prev_cpu);
 			if (new_cpu >= 0)
@@ -8890,8 +9293,34 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		return sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
 
 	/* Fast path */
-	if (wake_flags & WF_TTWU)
-		return select_idle_sibling(p, prev_cpu, new_cpu);
+	if (wake_flags & WF_TTWU) {
+		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+
+		/* SMT interactive placement: if the selected CPU is an SMT
+		 * thread with a busy sibling, and the waking task has low
+		 * EMA, try the primary thread of the same core instead.
+		 * This prevents an interactive task from sharing execution
+		 * units with a batch task on the other SMT thread.
+		 */
+		if (sched_smt_active() && READ_ONCE(p->infinity.ema) < 1000) {
+			int primary = cpumask_first(
+				topology_sibling_cpumask(new_cpu));
+
+			/*
+			 * The primary thread must be allowed for this task:
+			 * select_idle_sibling() guarantees new_cpu is in
+			 * p->cpus_ptr, but the sibling core may not be.
+			 */
+			if (primary != new_cpu &&
+			    cpumask_test_cpu(primary, p->cpus_ptr) &&
+			    available_idle_cpu(primary)) {
+				new_cpu = primary;
+				atomic64_inc(this_cpu_ptr(&infinity_smt_interactive_count));
+			}
+		}
+
+		return new_cpu;
+	}
 
 	return new_cpu;
 }
@@ -9818,6 +10247,23 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	if (task_on_cpu(env->src_rq, p) ||
 	    task_current_donor(env->src_rq, p)) {
 		schedstat_inc(p->stats.nr_failed_migrations_running);
+		return 0;
+	}
+
+	/*
+	 * Infinity: protect interactive (EMA=0) tasks from migration.
+	 * Keeping low-latency tasks cache-warm on their home CPU avoids the
+	 * L1/L2/L3 refill penalty that destroys frame-time consistency.
+	 * Active balance and desperate imbalance bypass this gate.
+	 */
+	if (!(env->flags & LBF_ACTIVE_LB) &&
+	    env->sd->nr_balance_failed <= env->sd->cache_nice_tries &&
+	    READ_ONCE(p->infinity.ema) == 0 &&
+	    /* Only protect tasks with a real runtime history.  Newly forked
+	     * tasks start with EMA=0 and must be free to spread across CPUs
+	     * during boot, otherwise CPU 0 becomes a bottleneck.
+	     */
+	    p->se.sum_exec_runtime > 2000000ULL) {
 		return 0;
 	}
 
