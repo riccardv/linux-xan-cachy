@@ -187,9 +187,17 @@ int sched_yield_type __read_mostly = 1;
  * task the same, which is the whole premise of the feature. Values above 100
  * weight I/O more heavily than CPU and are for experiment.
  *
- * The charge is capped at longest_deadline_diff(), so however large the debt
- * a task can never be demoted past the lowest priority. See
- * MuQSS-iotime-design.md.
+ * The result is then scaled by nice level through prio_penalty_diff(), the
+ * same way rr_interval is, so that the charge is in the same virtual currency
+ * as the deadline it is added to. One consequence is that 100 is one to one
+ * in deadline terms rather than in raw nanoseconds: at nice 0 the ratio is
+ * prio_ratios[20] / 128, about 6.7, exactly as an ordinary nice 0 timeslice
+ * is worth 6.7 rr_intervals of deadline. Idleprio tasks are always charged at
+ * the highest nice level; see task_penalty_diff().
+ *
+ * There is no ceiling on the charge. A task that keeps a device busy can be
+ * demoted arbitrarily far behind, past the deadline of the lowest nice level.
+ * See MuQSS-iotime-design.md.
  */
 int sched_iotime_scale __read_mostly = 100;
 #endif
@@ -774,6 +782,46 @@ static inline int ms_longest_deadline_diff(void)
 
 #ifdef CONFIG_MUQSS_IOTIME
 /*
+ * Scale an I/O time penalty by nice level, exactly as prio_deadline_diff()
+ * scales rr_interval. A deadline is virtual time, already stretched by
+ * prio_ratios[] before it means anything; adding raw nanoseconds of device
+ * time to it mixes two different currencies. Passing the penalty through the
+ * same ratio makes it commensurate with the deadline it is added to, so a
+ * given amount of I/O costs a task the same share of its own allotment
+ * whatever its nice level, and a niced down task is pushed back further in
+ * absolute terms than a niced up one for the same device time.
+ *
+ * The multiply is 64 bit, as it is in prio_deadline_diff(). Wrapping it would
+ * need a penalty over U64_MAX / prio_ratios[39], which is some forty days of
+ * device occupancy charged to one task between two scheduling events, so it
+ * is not a case worth writing code for.
+ */
+static inline u64 prio_penalty_diff(int user_prio, u64 penalty)
+{
+	return penalty * prio_ratios[user_prio] / 128;
+}
+
+/*
+ * Idleprio tasks are charged at the highest nice level whatever nice value
+ * they happen to carry. SCHED_IDLEPRIO is a class beneath the whole nice
+ * range rather than a position within it, and a task there has said it should
+ * run only when nothing else wants the CPU. Scaling by its own nice would let
+ * an idleprio task sitting at nice -20 be charged the lightest rate of all
+ * for keeping the disk busy, which is backwards. Their deadlines already sort
+ * below everything else in enqueue_task(); this keeps what they are charged
+ * for I/O consistent with that.
+ */
+static inline u64 task_penalty_diff(struct task_struct *p, u64 penalty)
+{
+	if (idleprio_task(p))
+		return prio_penalty_diff(39, penalty);
+
+	return prio_penalty_diff(TASK_USER_PRIO(p), penalty);
+}
+#endif
+
+#ifdef CONFIG_MUQSS_IOTIME
+/*
  * Take the block device time accumulated on this task's behalf since it was
  * last charged, and convert it to an amount of virtual deadline to push the
  * task back by. The debt is consumed as it is read, so each nanosecond of
@@ -800,7 +848,7 @@ static inline u64 consume_iotime_penalty(struct task_struct *p)
 
 	penalty = debt * sched_iotime_scale / 100;
 
-	return penalty;
+	return task_penalty_diff(p, penalty);
 }
 #else
 static inline u64 consume_iotime_penalty(struct task_struct *p)
