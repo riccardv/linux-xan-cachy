@@ -1292,6 +1292,7 @@ static int best_mask_cpu(int best_cpu, struct rq *rq, cpumask_t *tmpmask)
 	int best_ranking = CPUIDLE_DIFF_NODE | CPUIDLE_THREAD_BUSY |
 		CPUIDLE_DIFF_CPU | CPUIDLE_CACHE_BUSY | CPUIDLE_DIFF_CORE |
 		CPUIDLE_DIFF_CORE_LLC | CPUIDLE_DIFF_THREAD | CPUIDLE_NO_SIBLING;
+	unsigned long best_idle_jiffy = 0;
 	int cpu_tmp;
 
 	if (cpumask_test_cpu(best_cpu, tmpmask))
@@ -1328,9 +1329,13 @@ static int best_mask_cpu(int best_cpu, struct rq *rq, cpumask_t *tmpmask)
 		else if (!cpumask_subset(&tmp_rq->thread_mask, &cpu_idle_map))
 			ranking |= CPUIDLE_THREAD_BUSY;
 #endif
-		if (ranking < best_ranking) {
+		/* Also look for the most recently idled CPU as it will likely
+		 * be still at a higher CPU frequency */
+		if (ranking < best_ranking ||
+		    (ranking == best_ranking && tmp_rq->idle_jiffy > best_idle_jiffy)) {
 			best_cpu = cpu_tmp;
 			best_ranking = ranking;
+			best_idle_jiffy = tmp_rq->idle_jiffy;
 		}
 	}
 out:
@@ -4963,6 +4968,10 @@ static void __sched notrace __schedule(int sched_mode)
 	if (likely(next->prio != PRIO_LIMIT))
 		clear_cpuidle_map(cpu);
 	else {
+#ifdef CONFIG_SMP
+		if (prev != idle)
+			rq->idle_jiffy = jiffies;
+#endif
 		set_cpuidle_map(cpu);
 		update_load_avg(rq, 0);
 	}

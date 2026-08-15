@@ -303,6 +303,8 @@ struct rq {
 	bool (*cache_idle)(struct rq *rq);
 	/* See if all cache siblings are idle */
 #endif /* CONFIG_SCHED_MC */
+	/* last busy→idle, wakeup idle pick */
+	unsigned long idle_jiffy;
 #endif /* CONFIG_SMP */
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
