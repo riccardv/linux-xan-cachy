@@ -4037,7 +4037,14 @@ static void pc_system_time(struct rq *rq, struct task_struct *p,
 			cpustat[CPUTIME_IRQ] += (__force u64)TICK_APPROX_NS * ticks;
 			rq->irq_ns %= JIFFY_NS;
 		}
-	} else if (in_serving_softirq()) {
+	} else if (in_serving_softirq() || this_cpu_ksoftirqd() == p) {
+		/*
+		 * ksoftirqd time does not get accounted in cpu_softirq_time, so
+		 * it has to be handled separately here. Naming it explicitly
+		 * also catches it between batches, where it has reenabled bh
+		 * and in_serving_softirq() no longer holds - which is where the
+		 * context switch that lands us here happens.
+		 */
 		rq->softirq_ns += ns;
 		if (rq->softirq_ns >= JIFFY_NS) {
 			ticks = NS_TO_JIFFIES(rq->softirq_ns);
@@ -4069,19 +4076,6 @@ static void pc_user_time(struct rq *rq, struct task_struct *p, unsigned long ns)
 	}
 	p->sched_time += ns;
 	account_group_exec_runtime(p, ns);
-
-	if (this_cpu_ksoftirqd() == p) {
-		/*
-		 * ksoftirqd time do not get accounted in cpu_softirq_time.
-		 * So, we have to handle it separately here.
-		 */
-		rq->softirq_ns += ns;
-		if (rq->softirq_ns >= JIFFY_NS) {
-			ticks = NS_TO_JIFFIES(rq->softirq_ns);
-			cpustat[CPUTIME_SOFTIRQ] += (__force u64)TICK_APPROX_NS * ticks;
-			rq->softirq_ns %= JIFFY_NS;
-		}
-	}
 
 	if (task_nice(p) > 0 || idleprio_task(p)) {
 		rq->nice_ns += ns;
@@ -4136,11 +4130,29 @@ static void update_cpu_clock_switch(struct rq *rq, struct task_struct *p)
 	s64 account_ns = rq->niffies - p->last_ran;
 	struct task_struct *idle = rq->idle;
 
-	/* Accurate subtick timekeeping */
-	if (p != idle)
+	/*
+	 * Accurate subtick timekeeping. There is no interrupt frame to sample
+	 * here the way update_cpu_clock_tick() samples one: the entry code has
+	 * already restored the previous value by the time irqentry_exit()
+	 * reaches preempt_schedule_irq(), and a task that called schedule()
+	 * itself never had a frame at all. What can be said for certain is that
+	 * a task which never executes user code cannot have spent this interval
+	 * in userspace, so charge all of those as system time. Without this the
+	 * whole of every kernel thread's runtime that lands between two ticks
+	 * is booked as user time, which is how irq threads, kworkers and
+	 * ksoftirqd end up carrying utime they cannot possibly have accrued.
+	 *
+	 * A user task that blocks in a syscall genuinely does split its
+	 * interval between the two modes, and knowing where it crossed over
+	 * needs timestamped user/kernel transitions - vtime - that MuQSS
+	 * deliberately does not take. Those keep the historical assumption.
+	 */
+	if (p == idle)
+		pc_idle_time(rq, idle, account_ns);
+	else if (is_user_task(p))
 		pc_user_time(rq, p, account_ns);
 	else
-		pc_idle_time(rq, idle, account_ns);
+		pc_system_time(rq, p, 0, account_ns);
 
 	/* time_slice accounting is done in usecs to avoid overflow on 32bit */
 	if (p->policy != SCHED_FIFO && p != idle)
