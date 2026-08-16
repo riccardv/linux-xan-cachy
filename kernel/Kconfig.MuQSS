@@ -183,6 +183,16 @@ config MUQSS_IOTIME
 	  the block layer runs regardless, since observation is the point of
 	  that mode. Only N removes the cost.
 
+	  The same machinery charges a task for kernel work done in another
+	  thread's context on its behalf, which today means kworkers running
+	  work items it queued. Kernel work a task asks for in its own context
+	  needs no such help, since it already comes out of that task's own
+	  timeslice; what escapes the scheduler is the work handed to somebody
+	  else, and forcing IRQ threading moves more work into that blind spot.
+	  That is charged one for one and has no sysctl of its own, since a
+	  nanosecond of CPU time costs the same wherever the kernel chose to
+	  spend it. It is reported alongside the I/O figures.
+
 	  Doing this costs a timestamp and an owner reference on every block
 	  request, and an accounting update on every completion. On very fast
 	  devices, or under heavy small random I/O, that overhead is measurable

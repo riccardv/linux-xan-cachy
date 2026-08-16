@@ -23,6 +23,11 @@
  * dirtier is recorded on the folio when it is dirtied and recovered when the
  * flusher thread submits the I/O. See the owner table below.
  *
+ * The owner table earns its keep a second time over. A kworker running a work
+ * item declares itself to be acting for whoever queued that work, which both
+ * attributes the I/O the work item issues and lets the CPU time it costs be
+ * charged back as kern_debt_ns. See muqss_kerntime_begin().
+ *
  * How hard the occupancy is charged is set by kernel.iotime_scale, which
  * defaults to 100 and can be set to 0 to account without affecting
  * scheduling. Note that 0 stops the scheduler acting on the numbers but does
@@ -37,6 +42,7 @@
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
+#include <linux/workqueue_types.h>
 #include <linux/muqss_iotime.h>
 
 #include "blk.h"
@@ -109,6 +115,10 @@ static atomic64_t iowner_exhausted;
 
 static atomic64_t iowner_proxied;
 
+/* Work items charged back to a task, and the CPU time they cost. */
+static atomic64_t kernwork_charged;
+static atomic64_t kernwork_ns;
+
 /*
  * Slot for @tsk, allocating one on first use.
  *
@@ -177,18 +187,24 @@ out:
 unsigned int muqss_iotime_owner_slot(void)
 {
 	struct task_struct *tsk = current;
+	struct task_struct *owner;
 
 	/*
-	 * An io-wq worker dirties pages on behalf of the task that queued the
-	 * request, so tag them with that task. Doing otherwise would both
-	 * misattribute the writeback and let a churn of short lived workers
-	 * consume the whole slot table.
+	 * A thread running inside a proxy window dirties pages on behalf of
+	 * the task that window belongs to, so tag them with that task. Doing
+	 * otherwise would both misattribute the writeback and, for io-wq
+	 * workers, let a churn of short lived workers consume the whole slot
+	 * table.
+	 *
+	 * An io-wq worker outside a window has nobody to speak for and must
+	 * not claim a slot of its own. A kworker outside a window needs no
+	 * such test: iotime_task_slot() refuses PF_KTHREAD outright.
 	 */
-	if (tsk->flags & PF_IO_WORKER) {
-		tsk = READ_ONCE(tsk->io_owner_override);
-		if (!tsk)
-			return 0;
-	}
+	owner = READ_ONCE(tsk->io_owner_override);
+	if (owner)
+		tsk = owner;
+	else if (tsk->flags & PF_IO_WORKER)
+		return 0;
 
 	return iotime_task_slot(tsk);
 }
@@ -204,6 +220,59 @@ struct task_struct *muqss_iotime_proxy_begin(struct task_struct *owner)
 void muqss_iotime_proxy_end(struct task_struct *prev)
 {
 	WRITE_ONCE(current->io_owner_override, prev);
+}
+
+void muqss_work_set_owner(struct work_struct *work)
+{
+	work->muqss_owner_slot = muqss_iotime_owner_slot();
+}
+
+void muqss_kerntime_begin(struct muqss_kern_window *w, unsigned int slot)
+{
+	w->prev = NULL;
+	w->start = 0;
+
+	/*
+	 * Resolving the slot is what costs here, so it gates everything else.
+	 * Work queued by kernel threads on their own account carries slot 0
+	 * and leaves this function having done one branch, which matters:
+	 * timers, readahead, RCU and any amount of driver housekeeping run
+	 * through work items that belong to nobody.
+	 */
+	w->owner = muqss_iotime_owner_task(slot);
+	if (!w->owner)
+		return;
+
+	w->prev = muqss_iotime_proxy_begin(w->owner);
+	w->start = muqss_task_runtime_live();
+}
+
+void muqss_kerntime_end(struct muqss_kern_window *w)
+{
+	s64 ns;
+
+	if (!w->owner)
+		return;
+
+	ns = muqss_task_runtime_live() - w->start;
+	muqss_iotime_proxy_end(w->prev);
+
+	/*
+	 * Runtime rather than elapsed time, so a worker preempted for a whole
+	 * scheduling round does not hand the bill for it to the task it is
+	 * working for. Negative or absurd deltas are possible if the two ends
+	 * of the window landed either side of a clock warp, and are dropped
+	 * rather than clamped: there is no sensible value to substitute.
+	 */
+	if (ns > 0) {
+		atomic64_add(ns, &w->owner->kern_time_ns);
+		atomic64_add(ns, &w->owner->kern_debt_ns);
+		atomic64_inc(&kernwork_charged);
+		atomic64_add(ns, &kernwork_ns);
+	}
+
+	put_task_struct(w->owner);
+	w->owner = NULL;
 }
 
 struct task_struct *muqss_iotime_owner_task(unsigned int slot)
@@ -254,6 +323,8 @@ void muqss_iotime_task_init(struct task_struct *p)
 	atomic64_set(&p->io_count, 0);
 	atomic64_set(&p->io_occupancy_ns, 0);
 	atomic64_set(&p->io_debt_ns, 0);
+	atomic64_set(&p->kern_time_ns, 0);
+	atomic64_set(&p->kern_debt_ns, 0);
 	p->io_owner_slot = 0;
 	p->io_owner_override = NULL;
 }
@@ -584,6 +655,18 @@ static int muqss_iotime_owner_width_show(void *data, struct seq_file *m)
 	return 0;
 }
 
+static int muqss_iotime_kernwork_show(void *data, struct seq_file *m)
+{
+	seq_printf(m, "%llu\n", (u64)atomic64_read(&kernwork_charged));
+	return 0;
+}
+
+static int muqss_iotime_kernwork_ns_show(void *data, struct seq_file *m)
+{
+	seq_printf(m, "%llu\n", (u64)atomic64_read(&kernwork_ns));
+	return 0;
+}
+
 static const struct blk_mq_debugfs_attr muqss_iotime_debugfs_attrs[] = {
 	{"occupancy_ns", 0400, muqss_iotime_occupancy_show},
 	{"requests", 0400, muqss_iotime_requests_show},
@@ -594,6 +677,8 @@ static const struct blk_mq_debugfs_attr muqss_iotime_debugfs_attrs[] = {
 	{"owner_slots_exhausted", 0400, muqss_iotime_exhausted_show},
 	{"proxied", 0400, muqss_iotime_proxied_show},
 	{"owner_tag_bits", 0400, muqss_iotime_owner_width_show},
+	{"kernwork", 0400, muqss_iotime_kernwork_show},
+	{"kernwork_ns", 0400, muqss_iotime_kernwork_ns_show},
 	{},
 };
 #endif

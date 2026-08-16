@@ -913,6 +913,20 @@ struct task_struct {
 	atomic64_t			io_debt_ns;
 
 	/*
+	 * CPU time burnt in some other thread's context on this task's
+	 * behalf, currently kworkers running work items it queued. Unlike the
+	 * I/O counters above this is CPU time, which the task would have been
+	 * charged against its own time_slice had the kernel done the work
+	 * synchronously instead of handing it to a worker.
+	 *
+	 * kern_time_ns is cumulative and only for reporting. kern_debt_ns is
+	 * the part not yet charged to the deadline; the scheduler consumes
+	 * and zeroes it, see consume_kerntime_penalty().
+	 */
+	atomic64_t			kern_time_ns;
+	atomic64_t			kern_debt_ns;
+
+	/*
 	 * Index of this task's slot in the I/O owner table, stamped into
 	 * page->flags when it dirties a folio so writeback can be charged
 	 * back to it. 0 means no slot; allocated lazily on first dirty and
@@ -921,10 +935,13 @@ struct task_struct {
 	unsigned int			io_owner_slot;
 
 	/*
-	 * The task this one is currently doing I/O on behalf of, or NULL.
+	 * The task this one is currently working on behalf of, or NULL.
 	 * io_uring's io-wq workers publish the task that queued the request
 	 * here for the duration of the issue, so a submission punted to a
-	 * worker is still charged to the task that asked for it.
+	 * worker is still charged to the task that asked for it. kworkers do
+	 * the same around each work item, which additionally attributes any
+	 * I/O the work item submits, and any pages it dirties, to the task
+	 * that queued the work rather than losing them to a kernel thread.
 	 *
 	 * Only ever written by the task itself and only read while it is
 	 * running, so it needs no locking. The publisher holds a reference

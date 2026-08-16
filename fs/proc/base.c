@@ -535,6 +535,12 @@ static int proc_pid_schedstat(struct seq_file *m, struct pid_namespace *ns,
  * are based on. io_debt_ns is occupancy not yet charged to the deadline.
  * See block/blk-iotime.c.
  *
+ * kern_time_ns is CPU time rather than device time: kernel work done for this
+ * task in another thread's context, which today means kworkers running work
+ * items it queued. kern_debt_ns is the part of it not yet charged. Work the
+ * task asks for in its own context is not counted here, because that already
+ * comes out of its own timeslice.
+ *
  * Access is restricted exactly as /proc/PID/io is, and for the same reason:
  * these counters say when a task used the device and for how long, which is
  * enough to infer a good deal about what it is doing. The exec_update_lock
@@ -550,6 +556,8 @@ struct iotime_acct {
 	u64 count;
 	u64 occupancy_ns;
 	u64 debt_ns;
+	u64 kern_time_ns;
+	u64 kern_debt_ns;
 };
 
 static void iotime_add(struct iotime_acct *acct, struct task_struct *task)
@@ -558,6 +566,8 @@ static void iotime_add(struct iotime_acct *acct, struct task_struct *task)
 	acct->count += atomic64_read(&task->io_count);
 	acct->occupancy_ns += atomic64_read(&task->io_occupancy_ns);
 	acct->debt_ns += atomic64_read(&task->io_debt_ns);
+	acct->kern_time_ns += atomic64_read(&task->kern_time_ns);
+	acct->kern_debt_ns += atomic64_read(&task->kern_debt_ns);
 }
 
 static int do_iotime_accounting(struct task_struct *task, struct seq_file *m,
@@ -590,9 +600,11 @@ static int do_iotime_accounting(struct task_struct *task, struct seq_file *m,
 		   "io_latency_ns %llu\n"
 		   "io_count %llu\n"
 		   "io_occupancy_ns %llu\n"
-		   "io_debt_ns %llu\n",
+		   "io_debt_ns %llu\n"
+		   "kern_time_ns %llu\n"
+		   "kern_debt_ns %llu\n",
 		   acct.latency_ns, acct.count, acct.occupancy_ns,
-		   acct.debt_ns);
+		   acct.debt_ns, acct.kern_time_ns, acct.kern_debt_ns);
 
 out_unlock:
 	up_read(&task->signal->exec_update_lock);

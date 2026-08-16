@@ -8,7 +8,16 @@
  *
  * The attributed time is charged against the task's virtual deadline, at the
  * rate set by the kernel.iotime_scale sysctl. Set that to 0 to account and
- * report without affecting scheduling. See MuQSS-iotime-design.md.
+ * report without affecting scheduling.
+ *
+ * The same attribution carries CPU time as well as device time. A kworker
+ * running a work item declares itself to be acting for whoever queued that
+ * work, so the time it spends is charged back to them rather than lost to a
+ * kernel thread. That half is charged one for one and has no sysctl: a
+ * nanosecond of CPU time costs the same wherever the kernel chose to spend
+ * it, and work a task does in its own context already costs it exactly that.
+ *
+ * See MuQSS-iotime-design.md.
  */
 #ifndef _LINUX_MUQSS_IOTIME_H
 #define _LINUX_MUQSS_IOTIME_H
@@ -18,8 +27,20 @@ struct folio;
 struct request;
 struct gendisk;
 struct task_struct;
+struct work_struct;
 
 #ifdef CONFIG_MUQSS_IOTIME
+
+/*
+ * A window during which current is running on behalf of another task, opened
+ * by a kworker around one work item. Lives on the stack of the thread doing
+ * the work; see muqss_kerntime_begin().
+ */
+struct muqss_kern_window {
+	struct task_struct *owner;	/* who to charge, NULL for nobody */
+	struct task_struct *prev;	/* override to restore on close */
+	u64 start;			/* current's runtime when opened */
+};
 
 /*
  * Tag @bio with the task that caused it. Called from the block layer submit
@@ -84,7 +105,35 @@ void muqss_iotime_proxy_end(struct task_struct *prev);
  */
 void muqss_iotime_merge_requests(struct request *rq, struct request *next);
 
+/*
+ * Record who queued @work, so the kworker that eventually runs it can be
+ * charged to them. Called from the queueing task's own context, which rules
+ * out the deferred re-entries into __queue_work() made by the delayed work
+ * timer and the rcu_work callback: those run in interrupt and softirq
+ * context, where current is whoever was unlucky enough to be interrupted.
+ */
+void muqss_work_set_owner(struct work_struct *work);
+
+/*
+ * Open and close a window in which current is running work on behalf of the
+ * task in @slot. The CPU time current consumes across the window is charged
+ * to that task, and any I/O the work issues is attributed to it too.
+ *
+ * Cheap when there is nobody to charge, which is the common case: an unowned
+ * slot costs one comparison and reads no clocks.
+ */
+void muqss_kerntime_begin(struct muqss_kern_window *w, unsigned int slot);
+void muqss_kerntime_end(struct muqss_kern_window *w);
+
+/*
+ * The CPU time current has consumed so far, including the part not yet banked
+ * into ->sched_time. Implemented by the scheduler; see MuQSS.c.
+ */
+u64 muqss_task_runtime_live(void);
+
 #else  /* !CONFIG_MUQSS_IOTIME */
+
+struct muqss_kern_window { };
 
 static inline void muqss_iotime_set_owner(struct bio *bio) { }
 static inline void muqss_iotime_put_owner(struct bio *bio) { }
@@ -107,6 +156,10 @@ muqss_iotime_proxy_begin(struct task_struct *owner)
 static inline void muqss_iotime_proxy_end(struct task_struct *prev) { }
 static inline void muqss_iotime_merge_requests(struct request *rq,
 					       struct request *next) { }
+static inline void muqss_work_set_owner(struct work_struct *work) { }
+static inline void muqss_kerntime_begin(struct muqss_kern_window *w,
+					unsigned int slot) { }
+static inline void muqss_kerntime_end(struct muqss_kern_window *w) { }
 
 #endif /* CONFIG_MUQSS_IOTIME */
 

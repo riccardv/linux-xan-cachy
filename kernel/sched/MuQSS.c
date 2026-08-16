@@ -850,12 +850,71 @@ static inline u64 consume_iotime_penalty(struct task_struct *p)
 
 	return task_penalty_diff(p, penalty);
 }
+
+/*
+ * The same for CPU time spent in another thread's context on this task's
+ * behalf, which today means kworkers running work items it queued.
+ *
+ * Charged one for one, with no scale to tune it by. A nanosecond of CPU time
+ * is a nanosecond of CPU time wherever it was spent, and the whole premise
+ * here is that the thread it was spent in should not decide whether it counts.
+ * Work a task asks for in its own context is already charged at exactly that
+ * rate: update_cpu_clock_switch() and update_cpu_clock_tick() deduct it from
+ * ->time_slice with no regard for which mode it was spent in, so a task that
+ * burns its whole quantum inside a syscall is demoted as surely as one that
+ * spun in userspace. Charging deferred work at anything other than parity
+ * would say that where the kernel chose to do the work changes what it cost,
+ * which is the bug this exists to fix. Forcing IRQ threading, as -ck does,
+ * only moves more work into that blind spot.
+ *
+ * It is still scaled by nice through task_penalty_diff(), like every other
+ * addition to a deadline, so that it is in the same virtual currency as the
+ * deadline it lands on.
+ *
+ * As with iotime there is no ceiling. The runaway this invites is a different
+ * shape to the I/O case and worth naming, because here CPU consumption is
+ * being punished with CPU demotion: a demoted task need not stop generating
+ * the work, so it can be starved while kworkers keep charging it. It is
+ * bounded in practice because the debt a task can accrue is bounded by the
+ * work it queued, and a task demoted enough to stop running stops queueing
+ * more.
+ *
+ * Kept as a separate counter from io_debt_ns rather than folded into it,
+ * because the two are quantities of very different size: work item runtimes
+ * are microseconds where device occupancy is milliseconds, and sharing an
+ * accumulator would let one vanish into the rounding of the other. Separate
+ * also keeps them separable in /proc/<pid>/iotime when the question is why a
+ * task was demoted.
+ */
+static inline u64 consume_kerntime_penalty(struct task_struct *p)
+{
+	u64 debt = atomic64_xchg(&p->kern_debt_ns, 0);
+
+	if (!debt)
+		return 0;
+
+	return task_penalty_diff(p, debt);
+}
 #else
 static inline u64 consume_iotime_penalty(struct task_struct *p)
 {
 	return 0;
 }
+
+static inline u64 consume_kerntime_penalty(struct task_struct *p)
+{
+	return 0;
+}
 #endif
+
+/*
+ * Everything charged against a task's deadline that did not come out of its
+ * own time_slice.
+ */
+static inline u64 consume_task_penalty(struct task_struct *p)
+{
+	return consume_iotime_penalty(p) + consume_kerntime_penalty(p);
+}
 
 static inline bool rq_local(struct rq *rq);
 
@@ -1055,12 +1114,13 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * idleprio tasks last. Skiplist insertion is an O(log n) process.
 	 */
 	/*
-	 * Charge for device time consumed since this task was last queued.
-	 * Consumed unconditionally so debt cannot accumulate while a task is
-	 * realtime, but only applied below, since realtime and iso tasks sort
-	 * by priority rather than by deadline and so are never demoted.
+	 * Charge for device time and kernel work consumed since this task was
+	 * last queued. Consumed unconditionally so debt cannot accumulate
+	 * while a task is realtime, but only applied below, since realtime and
+	 * iso tasks sort by priority rather than by deadline and so are never
+	 * demoted.
 	 */
-	penalty = consume_iotime_penalty(p);
+	penalty = consume_task_penalty(p);
 
 	if (p->prio <= ISO_PRIO) {
 		sl_id = p->prio;
@@ -4159,6 +4219,48 @@ static void update_cpu_clock_switch(struct rq *rq, struct task_struct *p)
 		p->time_slice -= NS_TO_US(account_ns);
 }
 
+#ifdef CONFIG_MUQSS_IOTIME
+/*
+ * The CPU time current has consumed so far, for measuring how long a stretch
+ * of work took the thread doing it.
+ *
+ * ->sched_time alone is not enough. It is banked at ticks and at context
+ * switches, and a kworker's switches happen at the ends of a whole batch of
+ * work items, so the delta across any one of them is usually a flat zero. The
+ * unbanked remainder has to be added in, and that means reading a clock:
+ * sched_clock_cpu() rather than rq->niffies, which is only refreshed under
+ * the rq lock and would be stale by up to a tick here.
+ *
+ * niffies is monotonised forward of the raw clock, so last_ran can be ahead
+ * of what we read and the remainder can come out negative. Drop it in that
+ * case; it is bounded by the skew between the two and the banked figure is
+ * still right.
+ *
+ * Interrupts are off across the read so the tick cannot land between taking
+ * ->sched_time and taking ->last_ran and have the interval counted in both.
+ * That also pins us to this CPU, which is what makes the subtraction a
+ * same-clock one.
+ */
+u64 muqss_task_runtime_live(void)
+{
+	struct task_struct *p = current;
+	unsigned long flags;
+	s64 remainder;
+	u64 ns, ran;
+
+	local_irq_save(flags);
+	ns = p->sched_time;
+	ran = p->last_ran;
+	remainder = sched_clock_cpu(smp_processor_id()) - ran;
+	local_irq_restore(flags);
+
+	if (likely(remainder > 0))
+		ns += remainder;
+
+	return ns;
+}
+#endif
+
 /*
  * Return any ns on the sched_clock that have not yet been accounted in
  * @p in case that task is currently running.
@@ -4598,12 +4700,12 @@ static void time_slice_expired(struct task_struct *p, struct rq *rq)
 {
 	p->time_slice = timeslice();
 	/*
-	 * This assignment is absolute, so the iotime charge has to be folded
-	 * in here rather than left to enqueue_task(), or expiry would reset
-	 * the task to an uncharged baseline.
+	 * This assignment is absolute, so the charge has to be folded in here
+	 * rather than left to enqueue_task(), or expiry would reset the task
+	 * to an uncharged baseline.
 	 */
 	p->deadline = rq->niffies + task_deadline_diff(p) +
-		      consume_iotime_penalty(p);
+		      consume_task_penalty(p);
 #ifdef CONFIG_SMT_NICE
 	if (!p->mm)
 		p->smt_bias = 0;
