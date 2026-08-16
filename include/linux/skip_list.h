@@ -33,7 +33,7 @@ void skiplist_free(skiplist *l);
 void free_skiplist(skiplist *l);
 void skiplist_node_init(skiplist_node *node);
 void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int randseed);
-void skiplist_delete(skiplist *l, skiplist_node *node);
+bool skiplist_delete(skiplist *l, skiplist_node *node);
 
 static inline bool skiplist_node_empty(skiplist_node *node) {
 	return (!node->next[0]);

@@ -148,7 +148,12 @@ void skiplist_insert(skiplist *l, skiplist_node *node, keyType key, unsigned int
 	} while (--k >= 0);
 }
 
-void skiplist_delete(skiplist *l, skiplist_node *node)
+/*
+ * Unlink @node from @l. Returns true if it was linked and has been removed,
+ * false if it was not on any list and nothing was changed - the caller's own
+ * accounting has to be skipped along with the removal in that case.
+ */
+bool skiplist_delete(skiplist *l, skiplist_node *node)
 {
 	int k, m;
 
@@ -169,7 +174,7 @@ void skiplist_delete(skiplist *l, skiplist_node *node)
 	 * empty list, handing the caller the header as if it were a task.
 	 */
 	if (WARN_ON_ONCE(m < 0))
-		return;
+		return false;
 	skiplist_node_init(node);
 	if (m == l->level) {
 		while (l->header->next[m] == l->header && l->header->prev[m] == l->header && m > 0)
@@ -177,4 +182,6 @@ void skiplist_delete(skiplist *l, skiplist_node *node)
 		l->level = m;
 	}
 	WRITE_ONCE(l->entries, l->entries - 1);
+
+	return true;
 }

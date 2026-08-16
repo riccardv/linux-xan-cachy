@@ -931,7 +931,25 @@ static inline void update_best_key(struct rq *rq)
  */
 static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	skiplist_delete(rq->sl, &p->node);
+	/*
+	 * Everything below is accounting for @p having been on @rq, so none of
+	 * it may happen if it was not: a task whose node is unlinked is on no
+	 * runqueue at all and skiplist_delete() has left the list untouched.
+	 *
+	 * nr_running in particular is unsigned, so a single spurious decrement
+	 * wraps it to ~0 and the runqueue never looks empty again. That wedges
+	 * sched_cpu_wait_empty(), whose only exit is nr_running <= 1, and a CPU
+	 * offline then hangs forever with the dying CPU idle. psi_dequeue()
+	 * would likewise clear state that is counted somewhere else. Leaving
+	 * best_key alone is right for the same reason - the list did not
+	 * change.
+	 *
+	 * skiplist_delete() has already warned; this only keeps a lost race in
+	 * the caller from becoming permanent corruption of the runqueue.
+	 */
+	if (unlikely(!skiplist_delete(rq->sl, &p->node)))
+		return;
+
 	update_best_key(rq);
 	update_clocks(rq);
 
@@ -1506,9 +1524,47 @@ static inline void deactivate_task(struct task_struct *p, struct rq *rq)
 	psi_dequeue(p, DEQUEUE_SLEEP);
 }
 
+/*
+ * PSI counts the state a task is in per CPU, indexed by task_cpu(), so
+ * whenever task_cpu() changes for a task that still carries state, that state
+ * has to be moved with it. That is TSK_RUNNING for a task being taken to
+ * another runqueue, and TSK_IOWAIT for one that is still asleep. Whoever
+ * clears them next does so against task_cpu(p), and if that is no longer the
+ * CPU they were counted on the per-CPU counter underflows.
+ *
+ * TSK_ONCPU is deliberately not moved. It belongs to psi_sched_switch(), and
+ * a task whose CPU is being changed here is by definition not on one.
+ */
+#ifdef CONFIG_PSI
+static inline unsigned int psi_migrate_begin(struct task_struct *p)
+{
+	unsigned int migrate = p->psi_flags & ~TSK_ONCPU;
+
+	if (migrate)
+		psi_task_change(p, migrate, 0);
+	return migrate;
+}
+
+static inline void psi_migrate_end(struct task_struct *p, unsigned int migrate)
+{
+	if (migrate)
+		psi_task_change(p, 0, migrate);
+}
+#else /* !CONFIG_PSI */
+static inline unsigned int psi_migrate_begin(struct task_struct *p)
+{
+	return 0;
+}
+
+static inline void psi_migrate_end(struct task_struct *p, unsigned int migrate)
+{
+}
+#endif /* CONFIG_PSI */
+
 #ifdef CONFIG_SMP
 void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
+	unsigned int migrate;
 	struct rq *rq;
 
 	if (task_cpu(p) == new_cpu)
@@ -1560,38 +1616,13 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		return;
 	}
 
+	migrate = psi_migrate_begin(p);
 	WRITE_ONCE(task_thread_info(p)->cpu, new_cpu);
+	psi_migrate_end(p, migrate);
 	/* We're no longer protecting p after this point since we're holding
 	 * the wrong runqueue lock. */
 }
 #endif /* CONFIG_SMP */
-
-/*
- * PSI keeps per-CPU runnable counters. take_task() skips the usual
- * dequeue/enqueue pair (SAVE/RESTORE), so when the physical CPU changes we
- * must migrate TSK_RUNNING (and friends) ourselves or the next sleep clears
- * them on the wrong CPU → underflow. Leave TSK_ONCPU to psi_sched_switch().
- */
-#ifdef CONFIG_PSI
-static inline void psi_set_task_cpu(struct task_struct *p, int cpu)
-{
-	unsigned int migrate = p->psi_flags & ~TSK_ONCPU;
-
-	if (!migrate) {
-		set_task_cpu(p, cpu);
-		return;
-	}
-
-	psi_task_change(p, migrate, 0);
-	set_task_cpu(p, cpu);
-	psi_task_change(p, 0, migrate);
-}
-#else /* !CONFIG_PSI */
-static inline void psi_set_task_cpu(struct task_struct *p, int cpu)
-{
-	set_task_cpu(p, cpu);
-}
-#endif /* CONFIG_PSI */
 
 /*
  * Move a task off the runqueue and take it to a cpu for it will
@@ -1600,17 +1631,17 @@ static inline void psi_set_task_cpu(struct task_struct *p, int cpu)
 static inline void take_task(struct rq *rq, int cpu, struct task_struct *p)
 {
 	struct rq *p_rq = task_rq(p);
-	unsigned int old_cpu = task_cpu(p);
 
 	dequeue_task(p_rq, p, DEQUEUE_SAVE);
 	if (p_rq != rq) {
 		sched_info_dequeue(p_rq, p);
 		sched_info_enqueue(rq, p);
 	}
-	if (old_cpu != cpu)
-		psi_set_task_cpu(p, cpu);
-	else
-		set_task_cpu(p, cpu);
+	/*
+	 * DEQUEUE_SAVE left TSK_RUNNING in place, and set_task_cpu() moves it
+	 * to @cpu along with the task.
+	 */
+	set_task_cpu(p, cpu);
 }
 
 /*
@@ -1897,7 +1928,27 @@ static inline bool sched_other_cpu(struct task_struct *p, int cpu)
 	if (p->nr_cpus_allowed == 1) {
 		cpumask_t valid_mask;
 
+		/*
+		 * Nowhere left to send it, so it may as well run here. The mask
+		 * has to be the same one valid_task_cpu() uses to pick the
+		 * destination, or the two disagree and the task is placed on a
+		 * CPU that then refuses to run it.
+		 *
+		 * That is what a regular kthread affine to a single dying CPU
+		 * hits: the CPU is still online, so intersecting with
+		 * cpu_online_mask alone leaves it non-empty and this escape
+		 * hatch never fires, while is_cpu_allowed() has already refused
+		 * the dying CPU itself. It ends up runnable with no CPU willing
+		 * to pick it. bind_zero() would free it by overriding the
+		 * affinity, but that only runs from sched_cpu_wait_empty(),
+		 * several hotplug states later - and anything the CPU going
+		 * down waits for in between, such as blk_mq_hctx_notify_offline()
+		 * waiting on a threaded completion interrupt, deadlocks against
+		 * it.
+		 */
 		cpumask_and(&valid_mask, p->cpus_ptr, cpu_online_mask);
+		if (!kthread_is_per_cpu(p))
+			cpumask_andnot(&valid_mask, &valid_mask, cpu_dying_mask);
 		if (unlikely(cpumask_empty(&valid_mask)))
 			return false;
 	}
@@ -2131,7 +2182,7 @@ void sched_ttwu_pending(void *arg)
 		if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
 			set_task_cpu(p, cpu_of(rq));
 
-		ttwu_do_activate(rq, p, 0);
+		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0);
 	}
 
 	rq_unlock_irqrestore(rq, &rf);
@@ -2160,6 +2211,14 @@ bool call_function_single_prep_ipi(int cpu)
 static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
+
+	/*
+	 * Carry WF_MIGRATED across to the CPU that will do the enqueue. Losing
+	 * it there makes ttwu_do_activate() treat an already migrated wakeup
+	 * as a local one, decrementing rq->nr_iowait a second time and telling
+	 * PSI to clear an iowait that psi_ttwu_dequeue() has already dropped.
+	 */
+	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
 	WRITE_ONCE(rq->ttwu_pending, 1);
 	__smp_call_single_queue(cpu, &p->wake_entry.llist);
@@ -2307,10 +2366,23 @@ static inline int select_best_cpu(struct task_struct *p)
 	}
 	if (unlikely(!rq)) {
 		/*
-		 * Affinity may contain only offline CPUs (hotplug kthreads
-		 * bound before their CPU is up). Never place a wakeup there.
+		 * The walk found nowhere to put @p. Its affinity may contain
+		 * only offline CPUs (hotplug kthreads bound before their CPU
+		 * is up), or the walk may simply not have reached an allowed
+		 * one: cpu_order[] is built once at boot, so once any CPU is
+		 * offline the num_online_cpus() bound above stops short of its
+		 * tail and never examines what is there.
+		 *
+		 * Staying put is only an answer if this CPU is one @p is
+		 * allowed to run on. Otherwise defer to valid_task_cpu(),
+		 * which intersects the mask directly and so does not depend on
+		 * that ordering at all. Never place a wakeup on a CPU the task
+		 * is not allowed on, whether because it is offline or because
+		 * it is not in the mask; a blocked task keeps a stale
+		 * task_cpu() across an affinity change, so the latter is the
+		 * common case here.
 		 */
-		if (unlikely(!cpu_online(task_cpu(p))))
+		if (unlikely(needs_other_cpu(p, task_cpu(p))))
 			return valid_task_cpu(p);
 		return task_cpu(p);
 	}
@@ -3355,6 +3427,8 @@ static inline void finish_lock_switch(struct rq *rq, struct task_struct *prev)
 	 * remote lock we're migrating it to before enabling them.
 	 */
 	if (unlikely(task_on_rq_migrating(prev))) {
+		unsigned int migrate;
+
 		/*
 		 * Program/cancel hrexpiry on this CPU before dropping its
 		 * rq lock; after the unlock `rq` may become the remote one.
@@ -3362,21 +3436,50 @@ static inline void finish_lock_switch(struct rq *rq, struct task_struct *prev)
 		hrexpiry_schedule_exit(rq);
 		sched_info_dequeue(rq, prev);
 		/*
-		 * We move the ownership of prev to the new cpu now. ttwu can't
-		 * activate prev to the wrong cpu since it has to grab this
-		 * runqueue in ttwu_remote.
+		 * We move the ownership of prev to the new cpu now. Note that
+		 * this does not lock ttwu out: pointing task_cpu() at wake_cpu
+		 * below sends a concurrent ttwu_runnable() to the *new*
+		 * runqueue's lock rather than the one dropped here, and
+		 * __task_rq_lock() does not spin on task_on_rq_migrating() the
+		 * way mainline's does. See the re-check before enqueueing.
+		 *
+		 * This bypasses set_task_cpu(), so any PSI state prev is still
+		 * counted for has to be moved by hand, exactly as that does.
+		 * psi_sched_switch() saw prev off the CPU as a sleep, since it
+		 * is no longer queued, so a task in iowait is carrying
+		 * TSK_IOWAIT here and enqueue_task() below would clear it on
+		 * the new CPU that never counted it.
 		 */
-#ifdef CONFIG_THREAD_INFO_IN_TASK
+		migrate = psi_migrate_begin(prev);
 		task_thread_info(prev)->cpu = prev->wake_cpu;
-#else
-		task_thread_info(prev)->cpu = prev->wake_cpu;
-#endif
+		psi_migrate_end(prev, migrate);
 		raw_spin_unlock(rq->lock);
 
 		raw_spin_lock(&prev->pi_lock);
 		rq = __task_rq_lock(prev, NULL);
-		/* Check that someone else hasn't already queued prev */
-		if (likely(!task_queued(prev))) {
+		/*
+		 * Complete the handover only while it is still ours to
+		 * complete. ttwu() reaches prev here despite the comment
+		 * above: ttwu_runnable() only accepts TASK_ON_RQ_QUEUED, so a
+		 * wakeup that finds prev still TASK_ON_RQ_MIGRATING falls
+		 * through it and enqueues prev itself. Once it has, prev can be
+		 * picked and run on another CPU, and take_task() empties its
+		 * skiplist node again.
+		 *
+		 * task_queued() only asks whether that node is linked, so at
+		 * that point it reads "prev still needs enqueueing" when it
+		 * means "prev is running elsewhere", and puts a task that is on
+		 * a CPU back on a runqueue for a second CPU to pick up. One
+		 * task then runs on two CPUs off one stack, which shows up
+		 * downstream as skiplist corruption, PSI counting the task
+		 * twice, and a scribbled kernel stack.
+		 *
+		 * on_rq is what actually tracks the handover - return_task()
+		 * set TASK_ON_RQ_MIGRATING and whoever takes prev over clears
+		 * it - and pi_lock, held here and taken by ttwu() before it
+		 * does anything, serialises the two.
+		 */
+		if (likely(task_on_rq_migrating(prev))) {
 			enqueue_task(rq, prev, 0);
 			prev->on_rq = TASK_ON_RQ_QUEUED;
 			/* Wake up the CPU if it's not already running */
@@ -7314,6 +7417,9 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 	}
 }
 
+static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
+				   struct task_struct *p, int new_cpu);
+
 /*
  * Calling do_set_cpus_allowed from outside the scheduler code should not be
  * called on a running or queued task. We should be holding pi_lock.
@@ -7335,8 +7441,54 @@ void do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 		struct rq *rq;
 
 		rq = __task_rq_lock(p, NULL);
-		set_task_cpu(p, valid_task_cpu(p));
-		resched_task(p);
+		/*
+		 * A blocked task is on no runqueue, so task_cpu() only says
+		 * which rq lock protects it and which CPU PSI counts its state
+		 * on. It is left exactly as it is.
+		 *
+		 * Moving it would leave the TSK_IOWAIT it is carrying counted
+		 * on the CPU it came from, and the wakeup would then clear it
+		 * on a CPU that never counted it and underflow that counter.
+		 * Nor may the destination be recorded in wake_cpu: that is not
+		 * a hint, it is the bit that arms the lazy migration handshake.
+		 * return_task() reads wake_cpu != task_cpu() as "set_task_cpu()
+		 * moved this running task, hand it over in
+		 * finish_lock_switch()", so stamping it here arms a migration
+		 * no one arranged. Widening the mask again before the task
+		 * wakes is enough to leave it armed, since ttwu only calls
+		 * set_task_cpu() - the one place that resyncs wake_cpu - when
+		 * it picks a different CPU, and a wakeup back onto task_cpu()
+		 * therefore keeps the stale value until the next deschedule
+		 * migrates the task out from under the switch.
+		 *
+		 * Nothing needs either. select_best_cpu() honours the new mask
+		 * when the task wakes and set_task_cpu() takes the PSI state
+		 * with it, which is why affine_move_task() leaves a blocked
+		 * task alone here as well.
+		 */
+		if (task_running(rq, p)) {
+			/*
+			 * A running task is not on any skiplist, so
+			 * set_task_cpu() only tags wake_cpu for it; resched_task()
+			 * gets it off the CPU so finish_lock_switch() can
+			 * complete the move.
+			 */
+			set_task_cpu(p, valid_task_cpu(p));
+			resched_task(p);
+		} else if (task_queued(p)) {
+			/*
+			 * A queued task's skiplist node is linked into this
+			 * rq's list, so its CPU must not be rewritten
+			 * underneath it: task_rq(p) would then name a runqueue
+			 * the node is not in, and the next dequeue_task() would
+			 * try to unlink it from there and trip
+			 * skiplist_delete()'s "m < 0" while leaving the node
+			 * linked in the list it really is on. Unlink it first,
+			 * exactly as every other migration of a queued task
+			 * does.
+			 */
+			rq = move_queued_task(rq, NULL, p, valid_task_cpu(p));
+		}
 		__task_rq_unlock(rq, p, NULL);
 	}
 }
@@ -8074,10 +8226,16 @@ static int bind_zero_one(struct task_struct *p, int src_cpu)
 	    !is_migration_disabled(p)) {
 		dest = valid_task_cpu(p);
 		if (dest != src_cpu) {
+			/*
+			 * Only a queued task has to be moved. A blocked one is
+			 * on no runqueue, so it does not hold @src_cpu up, and
+			 * its destination must not be stamped into wake_cpu:
+			 * that arms return_task()'s migration handshake, which
+			 * would then fire on a task nobody is migrating. Its
+			 * wakeup picks an allowed CPU by itself.
+			 */
 			if (task_queued(p))
 				rq = move_queued_task(rq, &rf, p, dest);
-			else if (!task_running(rq, p))
-				p->wake_cpu = dest;
 		}
 	}
 
@@ -8179,11 +8337,15 @@ static void unbind_zero(int src_cpu)
 		if (!p->zerobound && needs_other_cpu(p, task_cpu(p))) {
 			int dest = valid_task_cpu(p);
 
+			/*
+			 * As in bind_zero_one(), a blocked task is left alone
+			 * rather than having @dest stamped into its wake_cpu,
+			 * which would arm return_task()'s migration handshake
+			 * for a migration that is not happening.
+			 */
 			if (task_queued(p))
 				rq = move_queued_task(rq, &rf, p, dest);
-			else if (!task_running(rq, p))
-				p->wake_cpu = dest;
-			else {
+			else if (task_running(rq, p)) {
 				set_task_cpu(p, dest);
 				resched_task(p);
 			}
@@ -8738,6 +8900,14 @@ enum sched_domain_level {
 	SD_LV_MAX
 };
 
+#ifdef CONFIG_SMT_NICE
+/*
+ * Recorded by select_leaders() and consumed by sched_init_smp() once the
+ * runqueue locks have been dropped. See the comment where it is set.
+ */
+static bool __initdata smt_nice_needed;
+#endif
+
 /*
  * Set up the relative cache distance of each online cpu from each
  * other in a simple array for quick lookup. Locality is determined
@@ -8746,6 +8916,9 @@ enum sched_domain_level {
  * (within the same package or physically) within the same node are
  * treated as not local. CPUs not even in the same domain (different
  * nodes) are treated as very distant.
+ *
+ * Called with interrupts disabled and every runqueue lock held, so nothing
+ * here may sleep or wait on another CPU.
  */
 static void __init select_leaders(void)
 {
@@ -8837,11 +9010,20 @@ static void __init select_leaders(void)
 	}
 
 #ifdef CONFIG_SMT_NICE
-	if (smt_threads) {
-		check_siblings = &check_smt_siblings;
-		wake_siblings = &wake_smt_siblings;
-		static_branch_enable(&smt_nice_enabled);
-	}
+	/*
+	 * Only record it here; sched_init_smp() turns SMT nice on once it has
+	 * dropped the runqueue locks and re-enabled interrupts.
+	 *
+	 * static_branch_enable() must not be called from this context. It
+	 * takes cpus_read_lock() and jump_label_mutex, either of which can
+	 * sleep - and scheduling from here would try to take a runqueue lock
+	 * this CPU already holds - and it then patches the jump site with
+	 * text_poke_bp(), which waits for every other CPU to answer a sync
+	 * IPI. Any CPU spinning on one of the runqueue locks held here has
+	 * interrupts disabled and can never answer, so the wait never ends and
+	 * the machine is gone with nothing on the console.
+	 */
+	smt_nice_needed = smt_threads;
 #endif
 
 	for_each_online_cpu(cpu) {
@@ -9143,6 +9325,21 @@ void __init sched_init_smp(void)
 	unlock_all_rqs();
 	local_irq_enable();
 	mutex_unlock(&sched_domains_mutex);
+
+#ifdef CONFIG_SMT_NICE
+	/*
+	 * Safe to patch the jump site only now that the runqueue locks are
+	 * dropped and interrupts are back on; see select_leaders(). Until
+	 * this point smt_schedule() just returns true and check_siblings()/
+	 * wake_siblings() are the no-op variants, which is correct behaviour,
+	 * merely without SMT nice.
+	 */
+	if (smt_nice_needed) {
+		check_siblings = &check_smt_siblings;
+		wake_siblings = &wake_smt_siblings;
+		static_branch_enable(&smt_nice_enabled);
+	}
+#endif
 
 	/*
 	 * Only now fold the runqueues together, and do it from stop_machine():
