@@ -303,7 +303,7 @@ static inline u64 account_other_time(u64 max)
 #ifdef CONFIG_64BIT
 static inline u64 read_sum_exec_runtime(struct task_struct *t)
 {
-	return t->se.sum_exec_runtime;
+	return tsk_seruntime(t);
 }
 #else /* !CONFIG_64BIT: */
 static u64 read_sum_exec_runtime(struct task_struct *t)
@@ -313,7 +313,7 @@ static u64 read_sum_exec_runtime(struct task_struct *t)
 	struct rq *rq;
 
 	rq = task_rq_lock(t, &rf);
-	ns = t->se.sum_exec_runtime;
+	ns = tsk_seruntime(t);
 	task_rq_unlock(rq, t, &rf);
 
 	return ns;
@@ -480,6 +480,19 @@ void account_process_tick(struct task_struct *p, int user_tick)
 {
 	u64 cputime, steal;
 
+	/*
+	 * MuQSS accounts this tick itself, from sched_tick() ->
+	 * update_cpu_clock_tick(), which update_process_times() calls a few
+	 * lines after calling us. Its accounting is in real nanoseconds rather
+	 * than whole ticks, and it is the same p->utime/p->stime and the same
+	 * kcpustat[] fields we would be adding to here, so running both counts
+	 * every busy tick twice. That is invisible in per-task figures, since
+	 * cputime_adjust() rescales utime/stime to sched_time, but it doubles
+	 * the busy buckets of /proc/stat. Leave it all to MuQSS.
+	 */
+	if (IS_ENABLED(CONFIG_SCHED_MUQSS))
+		return;
+
 	if (vtime_accounting_enabled_this_cpu())
 		return;
 
@@ -511,6 +524,16 @@ void account_process_tick(struct task_struct *p, int user_tick)
 void account_idle_ticks(unsigned long ticks)
 {
 	u64 cputime, steal;
+
+	/*
+	 * Same again for the idle ticks tick_nohz_account_idle_ticks() replays
+	 * on the way out of a nohz idle period. MuQSS has not missed them: it
+	 * charges the whole sleep to pc_idle_time() from the context switch
+	 * off the idle task, at nanosecond rather than jiffy granularity, so
+	 * replaying them here would only add a second copy.
+	 */
+	if (IS_ENABLED(CONFIG_SCHED_MUQSS))
+		return;
 
 	if (irqtime_enabled()) {
 		irqtime_account_idle_ticks(ticks);
@@ -628,7 +651,7 @@ out:
 void task_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 {
 	struct task_cputime cputime = {
-		.sum_exec_runtime = p->se.sum_exec_runtime,
+		.sum_exec_runtime = tsk_seruntime(p),
 	};
 
 	if (task_cputime(p, &cputime.utime, &cputime.stime))

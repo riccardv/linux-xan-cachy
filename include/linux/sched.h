@@ -43,6 +43,9 @@
 #include <linux/restart_block.h>
 #include <linux/rseq_types.h>
 #include <linux/seqlock_types.h>
+#ifdef CONFIG_SCHED_MUQSS
+#include <linux/skip_list.h>
+#endif
 #include <linux/kcsan.h>
 #include <linux/rv.h>
 #include <linux/uidgid_types.h>
@@ -334,6 +337,12 @@ extern long schedule_timeout_interruptible(long timeout);
 extern long schedule_timeout_killable(long timeout);
 extern long schedule_timeout_uninterruptible(long timeout);
 extern long schedule_timeout_idle(long timeout);
+
+extern long schedule_msec_hrtimeout(long timeout);
+extern long schedule_min_hrtimeout(void);
+extern long schedule_msec_hrtimeout_interruptible(long timeout);
+extern long schedule_msec_hrtimeout_uninterruptible(long timeout);
+
 asmlinkage void schedule(void);
 extern void schedule_preempt_disabled(void);
 asmlinkage void preempt_schedule_irq(void);
@@ -894,6 +903,79 @@ struct task_struct {
 	int				normal_prio;
 	unsigned int			rt_priority;
 
+#ifdef CONFIG_SCHED_MUQSS
+	int				time_slice;
+	u64				deadline;
+	skiplist_node			node; /* Skip list node */
+	u64				last_ran;
+	u64				sched_time; /* sched_clock time spent running */
+#ifdef CONFIG_SMT_NICE
+	int				smt_bias; /* Policy/nice level bias across smt siblings */
+#endif
+#ifdef CONFIG_HOTPLUG_CPU
+	bool				zerobound; /* Bound to CPU0 for hotplug */
+#endif
+	unsigned long			rt_timeout;
+	/* Unbanked cpu time */
+	unsigned long			utime_ns, stime_ns;
+#ifdef CONFIG_MUQSS_IOTIME
+	/*
+	 * Block device time consumed on this task's behalf. Updated from
+	 * I/O completion, which may be any CPU, so these are atomic. Read
+	 * via /proc/<pid>/iotime. Not inherited across fork. Bytes are not
+	 * counted here, task_io_accounting already has them.
+	 *
+	 * io_latency_ns is end to end per bio, so it includes queue wait and
+	 * is what a waiting task experiences. io_occupancy_ns is device
+	 * service time per request, which is what this task cost everybody
+	 * else, and is the only one of the two fit to charge for.
+	 *
+	 * io_debt_ns is occupancy not yet charged to the deadline. The
+	 * scheduler consumes and zeroes it; see consume_iotime_penalty().
+	 */
+	atomic64_t			io_latency_ns;
+	atomic64_t			io_count;
+	atomic64_t			io_occupancy_ns;
+	atomic64_t			io_debt_ns;
+
+	/*
+	 * CPU time burnt in some other thread's context on this task's
+	 * behalf, currently kworkers running work items it queued. Unlike the
+	 * I/O counters above this is CPU time, which the task would have been
+	 * charged against its own time_slice had the kernel done the work
+	 * synchronously instead of handing it to a worker.
+	 *
+	 * kern_time_ns is cumulative and only for reporting. kern_debt_ns is
+	 * the part not yet charged to the deadline; the scheduler consumes
+	 * and zeroes it, see consume_kerntime_penalty().
+	 */
+	atomic64_t			kern_time_ns;
+	atomic64_t			kern_debt_ns;
+
+	/*
+	 * Index of this task's slot in the I/O owner table, stamped into
+	 * page->flags when it dirties a folio so writeback can be charged
+	 * back to it. 0 means no slot; allocated lazily on first dirty and
+	 * released on exit.
+	 */
+	unsigned int			io_owner_slot;
+
+	/*
+	 * The task this one is currently working on behalf of, or NULL.
+	 * io_uring's io-wq workers publish the task that queued the request
+	 * here for the duration of the issue, so a submission punted to a
+	 * worker is still charged to the task that asked for it. kworkers do
+	 * the same around each work item, which additionally attributes any
+	 * I/O the work item submits, and any pages it dirties, to the task
+	 * that queued the work rather than losing them to a kernel thread.
+	 *
+	 * Only ever written by the task itself and only read while it is
+	 * running, so it needs no locking. The publisher holds a reference
+	 * to the pointee for the whole window.
+	 */
+	struct task_struct		*io_owner_override;
+#endif
+#else /* CONFIG_SCHED_MUQSS */
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
@@ -903,6 +985,7 @@ struct task_struct {
 	struct sched_ext_entity		scx;
 #endif
 	const struct sched_class	*sched_class;
+#endif /* CONFIG_SCHED_MUQSS */
 
 #ifdef CONFIG_SCHED_CORE
 	struct rb_node			core_node;
@@ -1678,6 +1761,8 @@ struct task_struct {
 	randomized_struct_fields_end
 } __attribute__ ((aligned (64)));
 
+#include <linux/muqss.h>
+
 #ifdef CONFIG_SCHED_PROXY_EXEC
 DECLARE_STATIC_KEY_TRUE(__sched_proxy_exec);
 static inline bool sched_proxy_exec(void)
@@ -2340,7 +2425,12 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 
 static inline bool task_is_runnable(struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_MUQSS
+	/* MuQSS has no delayed dequeue: queued means runnable. */
+	return p->on_rq;
+#else
 	return p->on_rq && !p->se.sched_delayed;
+#endif
 }
 
 extern bool sched_task_on_rq(struct task_struct *p);
