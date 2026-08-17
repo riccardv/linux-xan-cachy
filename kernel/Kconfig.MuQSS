@@ -164,24 +164,16 @@ config MUQSS_IOTIME
 	  figure. It is exported per task through /proc/<pid>/iotime and per
 	  device through debugfs.
 
-	  That figure can then be charged against the task's virtual deadline,
-	  demoting a task in proportion to the device time it consumed. This
-	  stops a task that keeps a disk busy on everybody else's behalf from
-	  retaining full CPU priority for free, while leaving tasks that merely
-	  wait on I/O as responsive as they are now.
+	  That figure is charged against the task's virtual deadline, demoting a
+	  task in proportion to the device time it consumed. This stops a task
+	  that keeps a disk busy on everybody else's behalf from retaining full
+	  CPU priority for free, while leaving tasks that merely wait on I/O as
+	  responsive as they are now.
 
-	  Charging is controlled at runtime by the sysctl
-	  kernel.iotime_scale, which is the percentage of consumed device time
-	  added to the deadline. It defaults to 100, charging a task one
-	  nanosecond of deadline per nanosecond of device time, so I/O and CPU
-	  cost a task equally. Set it to 0 to account and report without making
-	  any scheduling decision, which is the way to measure what the feature
-	  is doing before letting it act. Higher values weight I/O more heavily
-	  than CPU.
-
-	  Note that setting it to 0 does not make this free: the accounting in
-	  the block layer runs regardless, since observation is the point of
-	  that mode. Only N removes the cost.
+	  The charge is one nanosecond of deadline per nanosecond of device
+	  time, so I/O and CPU cost a task equally. That rate is what the
+	  feature means rather than a setting within it, so there is nothing to
+	  tune it by.
 
 	  The same machinery charges a task for kernel work done in another
 	  thread's context on its behalf, which today means kworkers running
@@ -189,9 +181,9 @@ config MUQSS_IOTIME
 	  needs no such help, since it already comes out of that task's own
 	  timeslice; what escapes the scheduler is the work handed to somebody
 	  else, and forcing IRQ threading moves more work into that blind spot.
-	  That is charged one for one and has no sysctl of its own, since a
-	  nanosecond of CPU time costs the same wherever the kernel chose to
-	  spend it. It is reported alongside the I/O figures.
+	  That is charged one for one, since a nanosecond of CPU time costs the
+	  same wherever the kernel chose to spend it. It is reported alongside
+	  the I/O figures.
 
 	  Doing this costs a timestamp and an owner reference on every block
 	  request, and an accounting update on every completion. On very fast

@@ -28,12 +28,11 @@
  * attributes the I/O the work item issues and lets the CPU time it costs be
  * charged back as kern_debt_ns. See muqss_kerntime_begin().
  *
- * How hard the occupancy is charged is set by kernel.iotime_scale, which
- * defaults to 100 and can be set to 0 to account without affecting
- * scheduling. Note that 0 stops the scheduler acting on the numbers but does
- * not stop this file gathering them: the accounting below runs either way,
- * and only CONFIG_MUQSS_IOTIME=n removes it. See consume_iotime_penalty() in
- * kernel/sched/MuQSS.c and MuQSS-iotime-design.md.
+ * The occupancy is charged one for one against the deadline, with nothing to
+ * tune it by: the accounting below and the scheduling it feeds are one
+ * feature, and only CONFIG_MUQSS_IOTIME=n removes either. See
+ * consume_iotime_penalty() in kernel/sched/MuQSS.c and
+ * MuQSS-iotime-design.md.
  */
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
