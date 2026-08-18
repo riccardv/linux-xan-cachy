@@ -22,9 +22,9 @@ $(if $(filter __%, $(MAKECMDGOALS)), \
 PHONY := __all
 __all:
 
-CKVERSION = -ck3
-CKNAME = MuQSS Powered
-EXTRAVERSION := $(EXTRAVERSION)$(CKVERSION)
+#CKVERSION = -ck3
+#CKNAME = MuQSS Powered
+#EXTRAVERSION := $(EXTRAVERSION)$(CKVERSION)
 
 # We are using a recursive build, so we need to do a little thinking
 # to get the ordering right.
