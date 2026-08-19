@@ -541,7 +541,6 @@ void free_task(struct task_struct *tsk)
 #endif
 	release_user_cpus_ptr(tsk);
 	scs_release(tsk);
-	smp_task_ipi_mask_free(tsk);
 
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -939,13 +938,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #endif
 	account_kernel_stack(tsk, 1);
 
-	err = smp_task_ipi_mask_alloc(tsk);
-	if (err)
-		goto free_stack;
-
 	err = scs_prepare(tsk, node);
 	if (err)
-		goto free_ipi_mask;
+		goto free_stack;
 
 #ifdef CONFIG_SECCOMP
 	/*
@@ -1022,8 +1017,6 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #endif
 	return tsk;
 
-free_ipi_mask:
-	smp_task_ipi_mask_free(tsk);
 free_stack:
 	exit_task_stack_account(tsk);
 	free_thread_stack(tsk);
