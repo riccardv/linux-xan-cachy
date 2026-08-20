@@ -56,6 +56,7 @@
 #include <linux/kvm_para.h>
 #include <linux/delay.h>
 #include <linux/irq_work.h>
+#include <linux/muqss_iotime.h>
 
 #include "workqueue_internal.h"
 
@@ -1438,7 +1439,7 @@ void wq_worker_running(struct task_struct *task)
 	 * CPU intensive auto-detection cares about how long a work item hogged
 	 * CPU without sleeping. Reset the starting timestamp on wakeup.
 	 */
-	worker->current_at = worker->task->se.sum_exec_runtime;
+	worker->current_at = tsk_seruntime(worker->task);
 
 	WRITE_ONCE(worker->sleeping, 0);
 }
@@ -1523,7 +1524,7 @@ void wq_worker_tick(struct task_struct *task)
 	 * We probably want to make this prettier in the future.
 	 */
 	if ((worker->flags & WORKER_NOT_RUNNING) || READ_ONCE(worker->sleeping) ||
-	    worker->task->se.sum_exec_runtime - worker->current_at <
+	    tsk_seruntime(worker->task) - worker->current_at <
 	    wq_cpu_intensive_thresh_us * NSEC_PER_USEC)
 		return;
 
@@ -2449,6 +2450,7 @@ bool queue_work_on(int cpu, struct workqueue_struct *wq,
 
 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
 	    !clear_pending_if_disabled(work)) {
+		muqss_work_set_owner(work);
 		__queue_work(cpu, wq, work);
 		ret = true;
 	}
@@ -2530,6 +2532,7 @@ bool queue_work_node(int node, struct workqueue_struct *wq,
 	    !clear_pending_if_disabled(work)) {
 		int cpu = select_numa_node_cpu(node);
 
+		muqss_work_set_owner(work);
 		__queue_work(cpu, wq, work);
 		ret = true;
 	}
@@ -2617,6 +2620,7 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
 
 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
 	    !clear_pending_if_disabled(work)) {
+		muqss_work_set_owner(work);
 		__queue_delayed_work(cpu, wq, dwork, delay);
 		ret = true;
 	}
@@ -2652,8 +2656,10 @@ bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 
 	ret = work_grab_pending(&dwork->work, WORK_CANCEL_DELAYED, &irq_flags);
 
-	if (!clear_pending_if_disabled(&dwork->work))
+	if (!clear_pending_if_disabled(&dwork->work)) {
+		muqss_work_set_owner(&dwork->work);
 		__queue_delayed_work(cpu, wq, dwork, delay);
+	}
 
 	local_irq_restore(irq_flags);
 	return ret;
@@ -2690,6 +2696,7 @@ bool queue_rcu_work(struct workqueue_struct *wq, struct rcu_work *rwork)
 	 */
 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
 	    !WARN_ON_ONCE(clear_pending_if_disabled(work))) {
+		muqss_work_set_owner(work);
 		rwork->wq = wq;
 		call_rcu_hurry(&rwork->rcu, rcu_work_rcufn);
 		return true;
@@ -3223,7 +3230,9 @@ __acquires(&pool->lock)
 {
 	struct pool_workqueue *pwq = get_work_pwq(work);
 	struct worker_pool *pool = worker->pool;
+	struct muqss_kern_window kern_window;
 	unsigned long work_data;
+	unsigned int muqss_owner;
 	int lockdep_start_depth, rcu_start_depth;
 	bool bh_draining = pool->flags & POOL_BH_DRAINING;
 #ifdef CONFIG_LOCKDEP
@@ -3249,10 +3258,22 @@ __acquires(&pool->lock)
 	worker->current_func = work->func;
 	worker->current_pwq = pwq;
 	if (worker->task)
-		worker->current_at = worker->task->se.sum_exec_runtime;
+		worker->current_at = tsk_seruntime(worker->task);
 	worker->current_start = jiffies;
 	work_data = *work_data_bits(work);
 	worker->current_color = get_work_color(work_data);
+
+	/*
+	 * Read while PENDING still holds this work item for us. Once it is
+	 * cleared below another CPU may requeue the same item and restamp it
+	 * with a different owner, and the one we are about to run belongs to
+	 * whoever queued it, not to them.
+	 *
+	 * A BH pool runs work in softirq context on top of whichever task was
+	 * interrupted, so worker->task is NULL and there is no worker runtime
+	 * to measure. Charge nobody there.
+	 */
+	muqss_owner = worker->task ? muqss_work_owner(work) : 0;
 
 	/*
 	 * Record wq name for cmdline and debug reporting, may get
@@ -3318,6 +3339,13 @@ __acquires(&pool->lock)
 	 * workqueues), so hiding them isn't a problem.
 	 */
 	lockdep_invariant_state(true);
+	/*
+	 * Everything from here to muqss_kerntime_end() is done on the queueing
+	 * task's account: the CPU time it costs this worker is charged back to
+	 * it, and so is any I/O the work item submits or any page it dirties,
+	 * which would otherwise be lost to a kernel thread.
+	 */
+	muqss_kerntime_begin(&kern_window, muqss_owner);
 	trace_workqueue_execute_start(work);
 	worker->current_func(work);
 	/*
@@ -3325,6 +3353,7 @@ __acquires(&pool->lock)
 	 * point will only record its address.
 	 */
 	trace_workqueue_execute_end(work, worker->current_func);
+	muqss_kerntime_end(&kern_window);
 
 	lock_map_release(&lockdep_map);
 	if (!bh_draining)
