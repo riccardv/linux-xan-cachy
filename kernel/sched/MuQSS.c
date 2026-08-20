@@ -172,36 +172,6 @@ int sched_iso_cpu __read_mostly = 70;
  */
 int sched_yield_type __read_mostly = 1;
 
-#ifdef CONFIG_MUQSS_IOTIME
-/*
- * sched_iotime_scale - how hard to charge a task for the block device time
- * spent on its behalf, as a percentage of that time. The charge is added to
- * the task's virtual deadline, so it is a demotion, not a boost: a task that
- * keeps a device busy for everybody else stops getting full CPU priority for
- * free.
- *
- * 0 disables charging entirely, leaving accounting in place for observation.
- * 100, the default, charges a task one nanosecond of deadline for each
- * nanosecond of device time it consumed. That one to one rate is the only
- * ratio with a meaning of its own: it says device time and CPU time cost a
- * task the same, which is the whole premise of the feature. Values above 100
- * weight I/O more heavily than CPU and are for experiment.
- *
- * The result is then scaled by nice level through prio_penalty_diff(), the
- * same way rr_interval is, so that the charge is in the same virtual currency
- * as the deadline it is added to. One consequence is that 100 is one to one
- * in deadline terms rather than in raw nanoseconds: at nice 0 the ratio is
- * prio_ratios[20] / 128, about 6.7, exactly as an ordinary nice 0 timeslice
- * is worth 6.7 rr_intervals of deadline. Idleprio tasks are always charged at
- * the highest nice level; see task_penalty_diff().
- *
- * There is no ceiling on the charge. A task that keeps a device busy can be
- * demoted arbitrarily far behind, past the deadline of the lowest nice level.
- * See MuQSS-iotime-design.md.
- */
-int sched_iotime_scale __read_mostly = 100;
-#endif
-
 /*
  * The relative length of deadline for each priority(nice) level.
  */
@@ -826,7 +796,25 @@ static inline u64 task_penalty_diff(struct task_struct *p, u64 penalty)
  * last charged, and convert it to an amount of virtual deadline to push the
  * task back by. The debt is consumed as it is read, so each nanosecond of
  * device time demotes the task exactly once no matter which caller gets to it
- * first.
+ * first. The charge is added to the deadline, so it is a demotion, not a
+ * boost: a task that keeps a device busy for everybody else stops getting
+ * full CPU priority for free.
+ *
+ * Charged one for one, a nanosecond of deadline for each nanosecond of device
+ * time consumed. That rate says device time and CPU time cost a task the
+ * same, which is the premise of the feature rather than a setting within it,
+ * so there is nothing to weight one against the other with.
+ *
+ * The charge is then scaled by nice through task_penalty_diff(), the same way
+ * rr_interval is, so that it is in the same virtual currency as the deadline
+ * it is added to. One for one is therefore one for one in deadline terms
+ * rather than in raw nanoseconds: at nice 0 the ratio is prio_ratios[20] /
+ * 128, about 6.7, exactly as an ordinary nice 0 timeslice is worth 6.7
+ * rr_intervals of deadline.
+ *
+ * There is no ceiling. A task that keeps a device busy can be demoted
+ * arbitrarily far behind, past the deadline of the lowest nice level. See
+ * MuQSS-iotime-design.md.
  *
  * This has to be consumed from both time_slice_expired() and enqueue_task().
  * Expiry alone misses the streaming reader, which blocks before exhausting its
@@ -837,26 +825,20 @@ static inline u64 task_penalty_diff(struct task_struct *p, u64 penalty)
  */
 static inline u64 consume_iotime_penalty(struct task_struct *p)
 {
-	u64 debt, penalty;
+	u64 debt = atomic64_xchg(&p->io_debt_ns, 0);
 
-	if (!sched_iotime_scale)
-		return 0;
-
-	debt = atomic64_xchg(&p->io_debt_ns, 0);
 	if (!debt)
 		return 0;
 
-	penalty = debt * sched_iotime_scale / 100;
-
-	return task_penalty_diff(p, penalty);
+	return task_penalty_diff(p, debt);
 }
 
 /*
  * The same for CPU time spent in another thread's context on this task's
  * behalf, which today means kworkers running work items it queued.
  *
- * Charged one for one, with no scale to tune it by. A nanosecond of CPU time
- * is a nanosecond of CPU time wherever it was spent, and the whole premise
+ * Charged one for one, as device time is. A nanosecond of CPU time is a
+ * nanosecond of CPU time wherever it was spent, and the whole premise
  * here is that the thread it was spent in should not decide whether it counts.
  * Work a task asks for in its own context is already charged at exactly that
  * rate: update_cpu_clock_switch() and update_cpu_clock_tick() deduct it from
@@ -3009,17 +2991,6 @@ static const struct ctl_table muqss_sysctls[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE_HUNDRED,
 	},
-#ifdef CONFIG_MUQSS_IOTIME
-	{
-		.procname	= "iotime_scale",
-		.data		= &sched_iotime_scale,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE_THOUSAND,
-	},
-#endif
 	{
 		.procname	= "yield_type",
 		.data		= &sched_yield_type,

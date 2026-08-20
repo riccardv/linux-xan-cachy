@@ -6,16 +6,16 @@
  * CPU scheduler can see what a task costs the storage device rather than only
  * what it costs the CPU.
  *
- * The attributed time is charged against the task's virtual deadline, at the
- * rate set by the kernel.iotime_scale sysctl. Set that to 0 to account and
- * report without affecting scheduling.
+ * The attributed time is charged against the task's virtual deadline one for
+ * one, a nanosecond of deadline for each nanosecond of device time, so that
+ * I/O and CPU cost a task the same.
  *
  * The same attribution carries CPU time as well as device time. A kworker
  * running a work item declares itself to be acting for whoever queued that
  * work, so the time it spends is charged back to them rather than lost to a
- * kernel thread. That half is charged one for one and has no sysctl: a
- * nanosecond of CPU time costs the same wherever the kernel chose to spend
- * it, and work a task does in its own context already costs it exactly that.
+ * kernel thread. That half is charged one for one: a nanosecond of CPU time
+ * costs the same wherever the kernel chose to spend it, and work a task does
+ * in its own context already costs it exactly that.
  *
  * See MuQSS-iotime-design.md.
  */
