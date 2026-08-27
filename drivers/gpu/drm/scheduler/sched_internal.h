@@ -4,6 +4,12 @@
 #define _DRM_GPU_SCHEDULER_INTERNAL_H_
 
 
+/* Used to choose between FIFO and RR job-scheduling */
+extern int drm_sched_policy;
+
+#define DRM_SCHED_POLICY_RR    0
+#define DRM_SCHED_POLICY_FIFO  1
+
 void drm_sched_wakeup(struct drm_gpu_scheduler *sched);
 
 void drm_sched_rq_add_entity(struct drm_sched_rq *rq,
@@ -11,7 +17,7 @@ void drm_sched_rq_add_entity(struct drm_sched_rq *rq,
 void drm_sched_rq_remove_entity(struct drm_sched_rq *rq,
 				struct drm_sched_entity *entity);
 
-void drm_sched_rq_update_vtime_locked(struct drm_sched_entity *entity,
+void drm_sched_rq_update_fifo_locked(struct drm_sched_entity *entity,
 				     struct drm_sched_rq *rq, ktime_t ts);
 
 void drm_sched_entity_select_rq(struct drm_sched_entity *entity);
