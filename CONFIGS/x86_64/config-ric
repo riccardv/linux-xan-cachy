@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/x86 7.1.10 Kernel Configuration
+# Linux/x86 7.1.12 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="gcc (Ubuntu 16-20260315-1ubuntu1~24~ppa1) 16.0.1 20260315 (experimental) [trunk r16-8100-g3aca3bae8ee]"
 CONFIG_CC_IS_GCC=y
