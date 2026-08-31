@@ -224,15 +224,132 @@ drm_sched_entity_restore_vruntime(struct drm_sched_entity *entity,
 static ktime_t drm_sched_entity_update_vruntime(struct drm_sched_entity *entity)
 {
 	struct drm_sched_entity_stats *stats = entity->stats;
-	ktime_t runtime, prev;
+	ktime_t runtime, prev, now;
+	s64 delta_ns;
 
 	spin_lock(&stats->lock);
 	prev = stats->prev_runtime;
 	runtime = stats->runtime;
 	stats->prev_runtime = runtime;
+	delta_ns = ktime_to_ns(ktime_sub(runtime, prev));
+
+	/* Infinity: EMA climb on the accounted GPU time.  The delta is the
+	 * duration of the job(s) completed since the last fold; climbing the
+	 * EMA here keeps all gpu_time_* updates in a single lock domain
+	 * (stats->lock) -- the completion path and the vruntime fold can no
+	 * longer race on the accounting state.
+	 */
+	if (delta_ns > 0) {
+		u64 climb_ns = delta_ns;
+
+		if (climb_ns > INFINITY_GPU_EMA_CLIMB_NS)
+			climb_ns = INFINITY_GPU_EMA_CLIMB_NS;
+
+		stats->gpu_time_ema += div64_u64(
+			(INFINITY_GPU_EMA_CLIMB_NS - stats->gpu_time_ema) *
+			climb_ns * INFINITY_GPU_EMA_ALPHA,
+			INFINITY_GPU_EMA_CLIMB_NS * (1ULL << 8));
+	}
+
+	/* Infinity: EMA decay and submission-interval tracking.  The gap
+	 * since the last fold is the wall-clock idle time of the entity;
+	 * decay the EMA by half-lives so a long-idle entity returns to the
+	 * fully-interactive state, and record the submission cadence for
+	 * job-type awareness.
+	 */
+	now = ktime_get();
+	if (stats->gpu_time_last_active) {
+		u64 idle_ns = ktime_to_ns(ktime_sub(now,
+					stats->gpu_time_last_active));
+		u64 periods = div64_u64(idle_ns,
+				INFINITY_GPU_EMA_HALFLIFE_NS);
+
+		if (periods > 63)
+			stats->gpu_time_ema = 0;
+		else if (periods)
+			stats->gpu_time_ema >>= periods;
+
+		stats->gpu_last_submit_interval = idle_ns;
+		if (periods)
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_idle_compensations));
+	} else {
+		stats->gpu_last_submit_interval = 0;
+	}
+	stats->gpu_time_last_active = now;
+
+	/* Infinity: EMA burst penalty.  Busy entities (high EMA) accrue
+	 * virtual time faster, so they drift back in the queue and the GPU
+	 * stays available to interactive entities.  Compositor-like
+	 * entities with fast submission intervals (every 1-8 ms) get the
+	 * burst penalty reduced by 25% (the code keeps 75% of it) so the
+	 * desktop stays smooth while batch workloads keep the full penalty.
+	 */
+	if (stats->gpu_time_ema > 0 && delta_ns > 0) {
+		u64 ema_pct = div64_u64(stats->gpu_time_ema * 100ULL,
+					INFINITY_GPU_EMA_CLIMB_NS);
+		s64 boost_ns;
+
+		if (ema_pct > 100)
+			ema_pct = 100;
+
+		boost_ns = delta_ns * ema_pct / 100;
+		if (stats->gpu_last_submit_interval > 0 &&
+		    stats->gpu_last_submit_interval < INFINITY_GPU_FAST_SUBMIT_NS)
+			boost_ns -= boost_ns >> 2;
+
+		delta_ns += boost_ns >> 1;
+	}
+
+	/* Infinity: CPU-to-GPU cross-scheduler coupling.  Read the owning
+	 * task's CPU-side interactivity signals via the entity's
+	 * infinity_pid: futex_waiting and a zero CPU EMA mark an
+	 * interactive task whose GPU submissions should not be treated as
+	 * bulk load.  Each signal halves this fold's vruntime growth, so
+	 * the entity drifts toward the front of the queue while its task
+	 * stays interactive.  The reduction is capped at 75% (both signals
+	 * present) so the fold's vruntime growth never freezes -- a
+	 * fully-frozen fold would let an interactive entity monopolize the
+	 * queue.
+	 *
+	 * RCU-safe: pid_task() under rcu_read_lock() returns NULL if the
+	 * task has exited, leaving the growth unchanged.
+	 */
+	if (entity->infinity_pid) {
+		struct task_struct *p;
+		u32 coupling = 0;
+
+		rcu_read_lock();
+		p = pid_task(entity->infinity_pid, PIDTYPE_PID);
+		/* Infinity: the infinity_pid resolves to the process group
+		 * leader; only fair-class, non-idle-policy leaders
+		 * participate in CPU-to-GPU coupling (see
+		 * infinity_is_interactive_candidate()).  Non-CFS leaders
+		 * keep coupling == 0.
+		 */
+		if (p && infinity_is_interactive_candidate(p)) {
+			if (READ_ONCE(p->infinity.futex_waiting))
+				coupling++;
+			if (READ_ONCE(p->infinity.ema) == 0)
+				coupling++;
+		}
+		rcu_read_unlock();
+
+		if (coupling) {
+			/* Cap the reduction at 75%: with both signals (coupling == 2)
+			 * the raw 100% reduction would freeze the fold's vruntime
+			 * growth and let an interactive entity monopolize the queue.
+			 */
+			u32 pct = min(50 * coupling, 75);
+
+			if (delta_ns < 0)
+				delta_ns = 0;
+			delta_ns = delta_ns * (100 - pct) / 100;
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_cpu_coupling_activations));
+		}
+	}
+
 	runtime = ktime_add_ns(stats->vruntime,
-			       ktime_to_ns(ktime_sub(runtime, prev)) <<
-			       vruntime_shift[entity->priority]);
+			       delta_ns << vruntime_shift[entity->priority]);
 	stats->vruntime = runtime;
 	spin_unlock(&stats->lock);
 
@@ -411,6 +528,57 @@ drm_sched_rq_select_entity(struct drm_gpu_scheduler *sched,
 			}
 
 			reinit_completion(&entity->entity_idle);
+
+			/* Infinity: GPU-to-CPU feedback.  Increment
+			 * gpu_passovers on the K nearest right-neighbors in
+			 * the rbtree (higher vruntime), so their owning
+			 * tasks' CPU-side infinity_wakeup() can detect
+			 * GPU-side starvation and accelerate EMA decay.
+			 * The K nearest entities are the closest to the next
+			 * pick (most relevant for starvation feedback);
+			 * entities deeper than K are credited on subsequent
+			 * selections as the winner moves.  This bounds the
+			 * credited work (and the locked atomics) to K
+			 * entities per selection; the walk may still pass
+			 * over ineligible nodes beyond K, but the expensive
+			 * per-entity accounting is bounded.
+			 */
+			if (entity->infinity_pid) {
+				struct rb_node *rb2;
+				int credited = 0;
+
+				rcu_read_lock();
+				for (rb2 = rb_next(rb); rb2;
+				     rb2 = rb_next(rb2)) {
+					struct drm_sched_entity *e2;
+					struct task_struct *p;
+
+					e2 = rb_entry(rb2, struct drm_sched_entity,
+						      rb_tree_node);
+					if (!drm_sched_entity_is_ready(e2))
+						continue;
+					if (!e2->infinity_pid)
+						continue;
+
+					p = pid_task(e2->infinity_pid,
+						     PIDTYPE_PID);
+					/* Infinity: only fair-class leaders
+					 * accumulate GPU passovers (see
+					 * infinity_is_interactive_candidate()).
+					 */
+					if (p &&
+					    infinity_is_interactive_candidate(p)) {
+						atomic_inc(&p->infinity.gpu_passovers);
+						atomic64_inc(this_cpu_ptr(
+							&infinity_gpu_passover_boosts));
+						++credited;
+					}
+					if (credited >=
+					    INFINITY_GPU_PASSOVER_MAX_ENTITIES)
+						break;
+				}
+				rcu_read_unlock();
+			}
 			break;
 		}
 	}
