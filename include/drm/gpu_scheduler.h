@@ -257,6 +257,15 @@ struct drm_sched_entity {
 	 */
 	struct rb_node			rb_tree_node;
 
+	/**
+	 * @infinity_pid: PID of the owning process.
+	 *
+	 * Captured in drm_sched_entity_init() via get_task_pid() and released
+	 * in drm_sched_entity_fini(), used by the Infinity CPU-to-GPU coupling
+	 * to read the owning task's CPU-side interactivity signals.  No
+	 * mid-life changes.
+	 */
+	struct pid			*infinity_pid;
 };
 
 /**
@@ -786,5 +795,29 @@ class_drm_sched_pending_job_iter_lock_ptr(class_drm_sched_pending_job_iter_t *_T
 	scoped_guard(drm_sched_pending_job_iter, (__sched))			\
 		list_for_each_entry((__job), &(__sched)->pending_list, list)	\
 			for_each_if(!(__entity) || (__job)->entity == (__entity))
+
+/* ------------------------------------------------------------------ */
+/* Infinity GPU scheduling constants                                   */
+/* ------------------------------------------------------------------ */
+#define INFINITY_GPU_EMA_CLIMB_NS       10000000ULL
+#define INFINITY_GPU_EMA_ALPHA          4
+#define INFINITY_GPU_EMA_HALFLIFE_NS    32000000ULL
+#define INFINITY_GPU_FAST_SUBMIT_NS     8000000ULL
+/** GPU->CPU pass-over feedback: max entities credited per selection (bounds the O(N) walk). */
+#define INFINITY_GPU_PASSOVER_MAX_ENTITIES 32
+
+#include <linux/atomic.h>
+#include <linux/percpu.h>
+#include <linux/pid.h>
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_completion_callbacks);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_accounting_applied);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_idle_compensations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_cpu_coupling_activations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_passover_boosts);
+
+/* ------------------------------------------------------------------ */
+/* Infinity sched-class gate (implemented in kernel/sched)             */
+/* ------------------------------------------------------------------ */
+bool infinity_is_interactive_candidate(struct task_struct *p);
 
 #endif

@@ -87,6 +87,13 @@ ktime_t drm_sched_entity_stats_job_add_gpu_time(struct drm_sched_job *job)
 	ewma_drm_sched_avgtime_add(&stats->avg_job_us, ktime_to_us(duration));
 	spin_unlock(&stats->lock);
 
+	/* Infinity: the job always carries a reference on its entity stats
+	 * object, so accounting can never miss the entity -- no separate
+	 * entity-not-found path exists on this scheduler layout.
+	 */
+	atomic64_inc(this_cpu_ptr(&infinity_gpu_completion_callbacks));
+	atomic64_inc(this_cpu_ptr(&infinity_gpu_accounting_applied));
+
 	return duration;
 }
 
@@ -176,6 +183,13 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
 
 	atomic_set(&entity->fence_seq, 0);
 	entity->fence_context = dma_fence_context_alloc(2);
+
+	/* Infinity: capture the owning process PID for cross-scheduler
+	 * coupling.  get_task_pid() takes a reference on the pid struct --
+	 * safe even if the process exits before entity_fini releases it.
+	 */
+	entity->infinity_pid = get_task_pid(current->group_leader,
+					    PIDTYPE_PID);
 
 	return 0;
 }
@@ -419,6 +433,11 @@ void drm_sched_entity_fini(struct drm_sched_entity *entity)
 	dma_fence_put(rcu_dereference_check(entity->last_scheduled, true));
 	RCU_INIT_POINTER(entity->last_scheduled, NULL);
 	drm_sched_entity_stats_put(entity->stats);
+
+	if (entity->infinity_pid) {
+		put_pid(entity->infinity_pid);
+		entity->infinity_pid = NULL;
+	}
 }
 EXPORT_SYMBOL(drm_sched_entity_fini);
 

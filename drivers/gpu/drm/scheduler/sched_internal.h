@@ -28,6 +28,23 @@ struct drm_sched_entity_stats {
 	ktime_t		prev_runtime;
 	ktime_t		vruntime;
 
+	/*
+	 * Infinity EMA of GPU time consumed.  Ceiling is
+	 * INFINITY_GPU_EMA_CLIMB_NS; decays by half-lives while the entity
+	 * is idle.  Protected by @lock.
+	 */
+	u64		gpu_time_ema;
+
+	/* ktime of the last job submission, for idle decay.  Protected by @lock. */
+	ktime_t		gpu_time_last_active;
+
+	/*
+	 * Interval between job submissions, used for job-type awareness
+	 * (compositor-like fast submitters get a reduced burst penalty).
+	 * Protected by @lock.
+	 */
+	u64		gpu_last_submit_interval;
+
 	struct ewma_drm_sched_avgtime   avg_job_us;
 };
 
