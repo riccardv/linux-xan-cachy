@@ -128,6 +128,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	},
 	.se		= {
 		.group_node 	= LIST_HEAD_INIT(init_task.se.group_node),
+		.inf_node	= LIST_HEAD_INIT(init_task.se.inf_node),
 	},
 	.rt		= {
 		.run_list	= LIST_HEAD_INIT(init_task.rt.run_list),
