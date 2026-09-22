@@ -3847,6 +3847,7 @@ static int pcie_acs_overrides(struct pci_dev *dev, u16 acs_flags)
 
 	return -ENOTTY;
 }
+
 /*
  * After asserting Secondary Bus Reset to downstream devices via a GB10
  * Root Port, the link may not retrain correctly.
@@ -5345,6 +5346,7 @@ static const struct pci_dev_acs_enabled {
 	{ PCI_VENDOR_ID_ZHAOXIN, PCI_ANY_ID, pci_quirk_zhaoxin_pcie_ports_acs },
 	/* Wangxun nics */
 	{ PCI_VENDOR_ID_WANGXUN, PCI_ANY_ID, pci_quirk_wangxun_nic_acs },
+	/* ACS override */
 	{ PCI_ANY_ID, PCI_ANY_ID, pcie_acs_overrides },
 	{ 0 }
 };
