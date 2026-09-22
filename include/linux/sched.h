@@ -601,6 +601,14 @@ struct sched_entity {
 
 	u64				nr_migrations;
 
+	/*
+	 * Infinity-queue (inf) FIFO node. Linked on cfs_rq->inf_list
+	 * while queued via the inf path; list-empty otherwise.
+	 * inf_slice_rem is the remaining inf quantum, nanoseconds.
+	 */
+	struct list_head		inf_node;
+	u64				inf_slice_rem;
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	int				depth;
 	struct sched_entity		*parent;
@@ -626,6 +634,7 @@ struct sched_rt_entity {
 	unsigned long			timeout;
 	unsigned long			watchdog_stamp;
 	unsigned int			time_slice;
+	u64				inf_slice_rem;
 	unsigned short			on_rq;
 	unsigned short			on_list;
 

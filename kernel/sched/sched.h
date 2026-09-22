@@ -737,6 +737,26 @@ struct cfs_rq {
 	u64			last_h_load_update;
 	struct sched_entity	*h_load_next;
 
+	/*
+	 * Infinity-queue (inf) FIFO state. inf_w_sum is the sum of
+	 * se->h_load.weight over entities on inf_list; never
+	 * se->load.weight, so hierarchical shares are honored.
+	 */
+	struct list_head	inf_list;
+	u32			inf_seq;
+	unsigned long		inf_w_sum;
+	u64			inf_head_inserts;
+	u64			inf_tail_inserts;
+	u64			inf_exempt_inserts;
+	u64			inf_hog_rotations;
+	u64			inf_head_preempts;
+	u64			inf_yield_to_moves;
+	u64			inf_curr_fallback_picks;
+	u64			inf_clamp_fires;
+	u64			inf_quantum_last;
+	u64			inf_quantum_min;
+	u64			inf_quantum_max;
+
 	struct rq		*rq;	/* CPU runqueue to which this cfs_rq is attached */
 
 	/*
@@ -854,6 +874,13 @@ struct rt_rq {
 	struct plist_head	pushable_tasks;
 
 	int			rt_queued;
+	u32			inf_seq;
+	u64			inf_head_inserts;
+	u64			inf_tail_inserts;
+	u64			inf_forced_requeues;
+	u64			inf_recharges;
+	u64			inf_expiries;
+	u64			inf_sole_skips;
 
 #ifdef CONFIG_RT_GROUP_SCHED
 	int			rt_throttled;
