@@ -4,12 +4,56 @@
  */
 
 #include <linux/delay.h>
+#include <linux/freezer.h>
 #include <linux/jiffies.h>
 #include <linux/timer.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/debug.h>
+#include <linux/sysctl.h>
 
 #include "tick-internal.h"
+
+/*
+ * Granularity, in microseconds, below which a high resolution timeout is not
+ * worth arming. Also caps how far clockevents_increase_min_delta() is allowed
+ * to raise a clock event device's minimum delta.
+ */
+int __read_mostly hrtimer_granularity_us = 100;
+
+/* The timeout, in microseconds, used by schedule_min_hrtimeout(). */
+int __read_mostly hrtimeout_min_us = 500;
+
+#ifdef CONFIG_SYSCTL
+static const int hrtimeout_us_max = 10000;
+
+static const struct ctl_table hrtimeout_sysctl[] = {
+	{
+		.procname	= "hrtimer_granularity_us",
+		.data		= &hrtimer_granularity_us,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= (void *)&hrtimeout_us_max,
+	},
+	{
+		.procname	= "hrtimeout_min_us",
+		.data		= &hrtimeout_min_us,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= (void *)&hrtimeout_us_max,
+	},
+};
+
+static int __init hrtimeout_sysctl_init(void)
+{
+	register_sysctl("kernel", hrtimeout_sysctl);
+	return 0;
+}
+device_initcall(hrtimeout_sysctl_init);
+#endif /* CONFIG_SYSCTL */
 
 /*
  * Since schedule_timeout()'s timer is defined on the stack, it must store
@@ -279,9 +323,163 @@ int __sched schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode)
 }
 EXPORT_SYMBOL_GPL(schedule_hrtimeout);
 
+#ifdef CONFIG_HIGH_RES_TIMERS
+/*
+ * As per schedule_hrtimeout but takes a millisecond value and returns how
+ * many milliseconds are left.
+ */
+long __sched schedule_msec_hrtimeout(long timeout)
+{
+	struct hrtimer_sleeper t;
+	int delta, jiffs;
+	ktime_t expires;
+
+	if (!timeout) {
+		__set_current_state(TASK_RUNNING);
+		return 0;
+	}
+
+	jiffs = msecs_to_jiffies(timeout);
+	/*
+	 * If regular timer resolution is adequate or hrtimer resolution is not
+	 * (yet) better than Hz, as would occur during startup, use regular
+	 * timers. Freezing gets the same treatment as some drivers still do not
+	 * correctly use freezable timeouts.
+	 */
+	if (jiffs > 4 || hrtimer_resolution >= NSEC_PER_SEC / HZ || pm_freezing)
+		return schedule_timeout(jiffs);
+
+	/* The jiffs > 4 test above bounds timeout well under one second. */
+	delta = (timeout % 1000) * NSEC_PER_MSEC;
+	expires = ktime_set(0, delta);
+
+	hrtimer_setup_sleeper_on_stack(&t, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	/*
+	 * No slack is given here. The whole point of taking the high resolution
+	 * path is that the timeout is too short for the tick to resolve, and a
+	 * slack of delta would push the expiry out to twice the request.
+	 */
+	hrtimer_set_expires(&t.timer, expires);
+
+	hrtimer_sleeper_start_expires(&t, HRTIMER_MODE_REL);
+
+	if (likely(t.task))
+		schedule();
+
+	hrtimer_cancel(&t.timer);
+	destroy_hrtimer_on_stack(&t.timer);
+
+	__set_current_state(TASK_RUNNING);
+
+	expires = hrtimer_expires_remaining(&t.timer);
+	timeout = ktime_to_ms(expires);
+	return timeout < 0 ? 0 : timeout;
+}
+
+EXPORT_SYMBOL(schedule_msec_hrtimeout);
+
+/*
+ * As per schedule_msec_hrtimeout but takes a microsecond value and returns
+ * how many microseconds are left.
+ */
+static long __sched schedule_usec_hrtimeout(long timeout)
+{
+	struct hrtimer_sleeper t;
+	ktime_t expires;
+	int delta;
+
+	if (!timeout) {
+		__set_current_state(TASK_RUNNING);
+		return 0;
+	}
+
+	if (hrtimer_resolution >= NSEC_PER_SEC / HZ)
+		return schedule_timeout(usecs_to_jiffies(timeout));
+
+	if (timeout < hrtimer_granularity_us)
+		timeout = hrtimer_granularity_us;
+	delta = (timeout % USEC_PER_SEC) * NSEC_PER_USEC;
+	expires = ktime_set(0, delta);
+
+	hrtimer_setup_sleeper_on_stack(&t, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	/* No slack is given here, as per schedule_msec_hrtimeout(). */
+	hrtimer_set_expires(&t.timer, expires);
+
+	hrtimer_sleeper_start_expires(&t, HRTIMER_MODE_REL);
+
+	if (likely(t.task))
+		schedule();
+
+	hrtimer_cancel(&t.timer);
+	destroy_hrtimer_on_stack(&t.timer);
+
+	__set_current_state(TASK_RUNNING);
+
+	expires = hrtimer_expires_remaining(&t.timer);
+	timeout = ktime_to_us(expires);
+	return timeout < 0 ? 0 : timeout;
+}
+
+long __sched schedule_min_hrtimeout(void)
+{
+	return usecs_to_jiffies(schedule_usec_hrtimeout(hrtimeout_min_us));
+}
+
+EXPORT_SYMBOL(schedule_min_hrtimeout);
+
+long __sched schedule_msec_hrtimeout_interruptible(long timeout)
+{
+	__set_current_state(TASK_INTERRUPTIBLE);
+	return schedule_msec_hrtimeout(timeout);
+}
+EXPORT_SYMBOL(schedule_msec_hrtimeout_interruptible);
+
+long __sched schedule_msec_hrtimeout_uninterruptible(long timeout)
+{
+	__set_current_state(TASK_UNINTERRUPTIBLE);
+	return schedule_msec_hrtimeout(timeout);
+}
+EXPORT_SYMBOL(schedule_msec_hrtimeout_uninterruptible);
+
+#else /* !CONFIG_HIGH_RES_TIMERS */
+
+/*
+ * Without high resolution timers there is nothing better than the regular
+ * jiffy based timeouts to fall back on.
+ */
+long __sched schedule_msec_hrtimeout(long timeout)
+{
+	return schedule_timeout(msecs_to_jiffies(timeout));
+}
+EXPORT_SYMBOL(schedule_msec_hrtimeout);
+
+long __sched schedule_min_hrtimeout(void)
+{
+	return schedule_timeout(1);
+}
+EXPORT_SYMBOL(schedule_min_hrtimeout);
+
+long __sched schedule_msec_hrtimeout_interruptible(long timeout)
+{
+	return schedule_timeout_interruptible(msecs_to_jiffies(timeout));
+}
+EXPORT_SYMBOL(schedule_msec_hrtimeout_interruptible);
+
+long __sched schedule_msec_hrtimeout_uninterruptible(long timeout)
+{
+	return schedule_timeout_uninterruptible(msecs_to_jiffies(timeout));
+}
+EXPORT_SYMBOL(schedule_msec_hrtimeout_uninterruptible);
+
+#endif /* CONFIG_HIGH_RES_TIMERS */
+
 /**
  * msleep - sleep safely even with waitqueue interruptions
  * @msecs:	Requested sleep duration in milliseconds
+ *
+ * Sleeps shorter than five ticks are handed to a high resolution timer instead,
+ * where that has better resolution than the tick, so the slack described below
+ * only applies to the jiffy based path.
  *
  * msleep() uses jiffy based timeouts for the sleep duration. Because of the
  * design of the timer wheel, the maximum additional percentage delay (slack) is
@@ -312,7 +510,19 @@ EXPORT_SYMBOL_GPL(schedule_hrtimeout);
  */
 void msleep(unsigned int msecs)
 {
-	unsigned long timeout = msecs_to_jiffies(msecs);
+	int jiffs = msecs_to_jiffies(msecs);
+	unsigned long timeout;
+
+	/*
+	 * Use high resolution timers where the resolution of tick based
+	 * timers is inadequate.
+	 */
+	if (jiffs < 5 && hrtimer_resolution < NSEC_PER_SEC / HZ && !pm_freezing) {
+		while (msecs)
+			msecs = schedule_msec_hrtimeout_uninterruptible(msecs);
+		return;
+	}
+	timeout = jiffs;
 
 	while (timeout)
 		timeout = schedule_timeout_uninterruptible(timeout);
@@ -333,7 +543,15 @@ EXPORT_SYMBOL(msleep);
  */
 unsigned long msleep_interruptible(unsigned int msecs)
 {
-	unsigned long timeout = msecs_to_jiffies(msecs);
+	int jiffs = msecs_to_jiffies(msecs);
+	unsigned long timeout;
+
+	if (jiffs < 5 && hrtimer_resolution < NSEC_PER_SEC / HZ && !pm_freezing) {
+		while (msecs && !signal_pending(current))
+			msecs = schedule_msec_hrtimeout_interruptible(msecs);
+		return msecs;
+	}
+	timeout = jiffs;
 
 	while (timeout && !signal_pending(current))
 		timeout = schedule_timeout_interruptible(timeout);
