@@ -84,19 +84,13 @@
 #define CREATE_TRACE_POINTS
 #include "gpu_scheduler_trace.h"
 
-/* Infinity bounded-LIFO is the default; revert to FIFO with sched_policy=1. */
-int drm_sched_policy = DRM_SCHED_POLICY_INFINITY;
+int drm_sched_policy = DRM_SCHED_POLICY_FIFO;
 
 /**
  * DOC: sched_policy (int)
  * Used to override default entities scheduling policy in a run queue.
  */
-MODULE_PARM_DESC(sched_policy,
-		 "Specify the scheduling policy for entities on a run-queue, "
-		 __stringify(DRM_SCHED_POLICY_RR) " = Round Robin, "
-		 __stringify(DRM_SCHED_POLICY_FIFO) " = FIFO, "
-		 __stringify(DRM_SCHED_POLICY_FAIR) " = Fair (experimental), "
-		 __stringify(DRM_SCHED_POLICY_INFINITY) " = Infinity bounded-LIFO (default).");
+MODULE_PARM_DESC(sched_policy, "Specify the scheduling policy for entities on a run-queue, " __stringify(DRM_SCHED_POLICY_RR) " = Round Robin, " __stringify(DRM_SCHED_POLICY_FIFO) " = FIFO (default), " __stringify(DRM_SCHED_POLICY_FAIR) " = Fair (experimental).");
 module_param_named(sched_policy, drm_sched_policy, int, 0444);
 
 static u32 drm_sched_available_credits(struct drm_gpu_scheduler *sched)
@@ -1179,7 +1173,6 @@ int drm_sched_init(struct drm_gpu_scheduler *sched, const struct drm_sched_init_
 	ewma_drm_sched_avgtime_init(&sched->avg_job_us);
 
 	sched->ready = true;
-	drm_sched_inf_track(sched);
 	return 0;
 Out_unroll:
 	for (--i ; i >= DRM_SCHED_PRIORITY_KERNEL; i--)
@@ -1226,7 +1219,6 @@ void drm_sched_fini(struct drm_gpu_scheduler *sched)
 
 	drm_sched_wqueue_stop(sched);
 
-	drm_sched_inf_untrack(sched);
 	for (i = DRM_SCHED_PRIORITY_KERNEL; i < sched->num_rqs; i++)
 		kfree(sched->sched_rq[i]);
 

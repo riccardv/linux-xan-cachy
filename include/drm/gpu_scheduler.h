@@ -257,35 +257,17 @@ struct drm_sched_entity {
 	 */
 	struct rb_node			rb_tree_node;
 
-	/**
-	 * @inf_node:
-	 *
-	 * The node used to insert this entity into the Infinity bounded-LIFO
-	 * ordering. Protected by &drm_sched_rq.lock of @rq.
-	 */
-	struct list_head		inf_node;
-
 };
 
 /**
  * struct drm_sched_rq - queue of entities to be scheduled.
  *
  * @sched: the scheduler to which this rq belongs to.
- * @lock: protects @entities, @rb_tree_root, @rr_ts, @inf_list, @inf_seq,
- * @inf_head_inserts, @inf_tail_inserts, @inf_select_hits, @inf_scan_skips,
- * @inf_enospc_stops and @head_prio.
+ * @lock: protects @entities, @rb_tree_root, @rr_ts and @head_prio.
  * @rr_ts: monotonically incrementing fake timestamp for RR mode.
  * @entities: list of the entities to be scheduled.
  * @rb_tree_root: root of time based priority queue of entities for FIFO scheduling
  * @head_prio: priority of the top tree element.
- * @inf_list: list of entities for Infinity bounded-LIFO scheduling.
- * @inf_seq: monotonically incrementing sequence deciding the Infinity
- * bounded-LIFO insert position (7 head inserts + 1 tail insert per 8).
- * @inf_head_inserts: Infinity head inserts (fast lane).
- * @inf_tail_inserts: Infinity tail inserts (forced progress).
- * @inf_select_hits: Infinity select hits (effective picks).
- * @inf_scan_skips: Infinity scan skips (not-ready entities skipped).
- * @inf_enospc_stops: Infinity ENOSPC stops (credit-pressure signal).
  *
  * Run queue is a set of entities scheduling command submissions for
  * one specific ring. It implements the scheduling policy that selects
@@ -300,13 +282,6 @@ struct drm_sched_rq {
 	struct list_head		entities;
 	struct rb_root_cached		rb_tree_root;
 	enum drm_sched_priority		head_prio;
-	struct list_head		inf_list;
-	u32				inf_seq;
-	u64				inf_head_inserts;
-	u64				inf_tail_inserts;
-	u64				inf_select_hits;
-	u64				inf_scan_skips;
-	u64				inf_enospc_stops;
 };
 
 /**

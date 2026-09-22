@@ -129,7 +129,6 @@ int drm_sched_entity_init(struct drm_sched_entity *entity,
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&entity->list);
-	INIT_LIST_HEAD(&entity->inf_node);
 	entity->rq = NULL;
 	entity->guilty = guilty;
 	entity->priority = priority;

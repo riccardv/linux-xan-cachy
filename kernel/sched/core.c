@@ -4590,8 +4590,6 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.vlag			= 0;
 	p->se.rel_deadline		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
-	INIT_LIST_HEAD(&p->se.inf_node);
-	p->se.inf_slice_rem		= 0;
 
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
@@ -4613,8 +4611,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 
 	INIT_LIST_HEAD(&p->rt.run_list);
 	p->rt.timeout		= 0;
-	p->rt.time_slice	= 0;
-	p->rt.inf_slice_rem	= 0;
+	p->rt.time_slice	= sched_rr_timeslice;
 	p->rt.on_rq		= 0;
 	p->rt.on_list		= 0;
 
