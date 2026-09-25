@@ -165,6 +165,19 @@ else
 	# Use -mskip-rax-setup if supported.
 	KBUILD_CFLAGS += -mskip-rax-setup
 
+ifdef CONFIG_X86_NATIVE_CPU
+        KBUILD_CFLAGS += -march=native
+        # Prevent the compiler from generating EGPR use. The kernel is
+        # not yet prepared for general in-kernel use.
+        KBUILD_CFLAGS += $(call cc-option,-mno-apx-features=egpr)
+
+        # generate_rust_target.rs handles Rust APX gating.
+        KBUILD_RUSTFLAGS += -Ctarget-cpu=native
+else
+        KBUILD_CFLAGS += -march=x86-64 -mtune=generic
+        KBUILD_RUSTFLAGS += -Ctarget-cpu=x86-64 -Ztune-cpu=generic
+endif
+
         KBUILD_CFLAGS += -mno-red-zone
         KBUILD_CFLAGS += -mcmodel=kernel
         KBUILD_RUSTFLAGS += -Cno-redzone=y
