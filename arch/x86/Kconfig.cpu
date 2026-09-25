@@ -209,17 +209,6 @@ config MATOM
 
 endchoice
 
-config RUSTC_HAS_APXF
-	# The kernel isn't ready for in-kernel APX instructions. Without
-	# explicit frontend gating of APX, the backend may emit those
-	# instructions in native builds.
-	#
-	# Rust 1.88 added the `apxf` feature option, but versions before 1.93
-	# emit an `apxf` target attribute that only LLVM 23+ can interpret.
-	def_bool (RUSTC_VERSION >= 108800 && RUSTC_LLVM_MAJOR_VERSION >= 23) || \
-		 RUSTC_VERSION >= 109300
-
-
 config CC_HAS_MARCH_NATIVE
 	# This flag might not be available in cross-compilers:
 	def_bool $(cc-option, -march=native)
@@ -230,9 +219,15 @@ config CC_HAS_MARCH_NATIVE
 	# usage warnings that only appear wth '-march=native'.
 	depends on CC_IS_GCC || CLANG_VERSION >= 190100
 
-choice
-	prompt "x86-64 Processor family"
-	default GENERIC_CPU
+config RUSTC_HAS_APXF
+	# The kernel isn't ready for in-kernel APX instructions. Without
+	# explicit frontend gating of APX, the backend may emit those
+	# instructions in native builds.
+	#
+	# Rust 1.88 added the `apxf` feature option, but versions before 1.93
+	# emit an `apxf` target attribute that only LLVM 23+ can interpret.
+	def_bool (RUSTC_VERSION >= 108800 && RUSTC_LLVM_MAJOR_VERSION >= 23) || \
+		 RUSTC_VERSION >= 109300
 
 config X86_NATIVE_CPU
 	bool "Build and optimize for local/native CPU"
@@ -248,6 +243,10 @@ config X86_NATIVE_CPU
 	  different x86 machine.
 
 	  If unsure, say N.
+
+choice
+	prompt "x86-64 Processor family"
+	default GENERIC_CPU
 
 config MK8
 	bool "AMD Opteron/Athlon64/Hammer/K8"
