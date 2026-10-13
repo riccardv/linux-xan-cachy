@@ -478,41 +478,27 @@ int tb_port_state(struct tb_port *port)
 	return phy.state;
 }
 
-/* Delay between two consecutive reads of the port state */
-#define TB_PORT_WAIT_INTERVAL_MS	100
-/* How long a port is given to reach TB_PORT_UP while scanning */
-#define TB_PORT_WAIT_TIMEOUT_MS		1000
-/* ... and while a router is coming back from suspend */
-#define TB_PORT_RESUME_TIMEOUT_MS	5000
-
 /**
  * tb_wait_for_port() - wait for a port to become ready
  * @port: Port to wait
  * @wait_if_unplugged: Wait also when port is unplugged
  *
- * Wait for a port to reach state TB_PORT_UP. If wait_if_unplugged is set
- * then we also wait if the port is in state TB_PORT_UNPLUGGED (it takes a
- * while for the device to be registered after switch resume), and the port
- * is given %TB_PORT_RESUME_TIMEOUT_MS rather than %TB_PORT_WAIT_TIMEOUT_MS,
- * because a USB4 dock can need several seconds to retrain its link.
- * Otherwise we only wait if a device is registered but the link has not yet
- * been established.
+ * Wait up to 1 second for a port to reach state TB_PORT_UP. If
+ * wait_if_unplugged is set then we also wait if the port is in state
+ * TB_PORT_UNPLUGGED (it takes a while for the device to be registered after
+ * switch resume). Otherwise we only wait if a device is registered but the link
+ * has not yet been established.
  *
  * Return:
  * * %0 - If the port is not connected or failed to reach
- *   state %TB_PORT_UP in time.
+ *   state %TB_PORT_UP within one second.
  * * %1 - If the port is connected and in state %TB_PORT_UP.
  * * Negative errno - An error occurred.
  */
 int tb_wait_for_port(struct tb_port *port, bool wait_if_unplugged)
 {
-	int retries, state;
-
-	if (wait_if_unplugged)
-		retries = TB_PORT_RESUME_TIMEOUT_MS / TB_PORT_WAIT_INTERVAL_MS;
-	else
-		retries = TB_PORT_WAIT_TIMEOUT_MS / TB_PORT_WAIT_INTERVAL_MS;
-
+	int retries = 10;
+	int state;
 	if (!port->cap_phy) {
 		tb_port_WARN(port, "does not have PHY\n");
 		return -EINVAL;
@@ -534,7 +520,7 @@ int tb_wait_for_port(struct tb_port *port, bool wait_if_unplugged)
 				/* used during resume */
 				tb_port_dbg(port,
 					    "is unplugged (state: 7), retrying...\n");
-				msleep(TB_PORT_WAIT_INTERVAL_MS);
+				msleep(100);
 				break;
 			}
 			tb_port_dbg(port, "is unplugged (state: 7)\n");
@@ -559,7 +545,7 @@ int tb_wait_for_port(struct tb_port *port, bool wait_if_unplugged)
 			tb_port_dbg(port,
 				    "is connected, link is not up (state: %d), retrying...\n",
 				    state);
-			msleep(TB_PORT_WAIT_INTERVAL_MS);
+			msleep(100);
 		}
 
 	}
