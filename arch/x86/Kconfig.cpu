@@ -230,7 +230,7 @@ config RUSTC_HAS_APXF
 		 RUSTC_VERSION >= 109300
 
 choice
-	prompt "x86-64 Processor family"
+	prompt "x86_64 Compiler Build Optimization"
 	default GENERIC_CPU
 
 config X86_NATIVE_CPU
