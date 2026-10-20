@@ -54,7 +54,7 @@ static int unix_fs_perm(const char *op, u32 mask, const struct cred *subj_cred,
 		};
 
 		return aa_path_perm(op, subj_cred, label, path,
-				    PATH_SOCK_COND, mask, &cond);
+				    PATH_SOCK_COND, mask, &cond, NULL);
 	} /* else implicitly delegated */
 
 	return 0;
@@ -219,8 +219,8 @@ static int profile_create_perm(struct aa_profile *profile, int family,
 				   NULL, ad);
 	}
 
-	return aa_profile_af_perm(profile, ad, AA_MAY_CREATE, family, type,
-				  protocol);
+	return aa_profile_af_compat_perm(profile, ad, AA_MAY_CREATE, family,
+					 type);
 }
 
 static int profile_sk_perm(struct aa_profile *profile,

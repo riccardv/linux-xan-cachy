@@ -456,6 +456,7 @@ LSM_HOOK(int, 0, bpf_token_capable, const struct bpf_token *token, int cap)
 
 LSM_HOOK(int, 0, locked_down, enum lockdown_reason what)
 
+
 #ifdef CONFIG_PERF_EVENTS
 LSM_HOOK(int, 0, perf_event_open, int type)
 LSM_HOOK(int, 0, perf_event_alloc, struct perf_event *event)

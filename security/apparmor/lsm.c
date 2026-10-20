@@ -19,6 +19,8 @@
 #include <linux/sysctl.h>
 #include <linux/sysfs.h>
 #include <linux/audit.h>
+#include <linux/nsproxy.h>
+#include <linux/ipc_namespace.h>
 #include <linux/user_namespace.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
@@ -36,6 +38,7 @@
 #include "include/cred.h"
 #include "include/crypto.h"
 #include "include/file.h"
+#include "include/inode.h"
 #include "include/ipc.h"
 #include "include/net.h"
 #include "include/path.h"
@@ -48,6 +51,8 @@
 
 /* Flag indicating whether initialization completed */
 int apparmor_initialized;
+
+struct kmem_cache *aa_audit_slab;
 
 union aa_buffer {
 	struct list_head list;
@@ -67,6 +72,11 @@ static int buffer_count;
 static LIST_HEAD(aa_global_buffers);
 static DEFINE_SPINLOCK(aa_buffers_lock);
 static DEFINE_PER_CPU(struct aa_local_cache, aa_local_buffers);
+
+static bool is_mqueue_dentry(struct dentry *dentry)
+{
+	return dentry && is_mqueue_inode(d_backing_inode(dentry));
+}
 
 /*
  * LSM hook functions
@@ -228,7 +238,7 @@ static int common_perm(const char *op, const struct path *path, u32 mask,
 	label = __begin_current_label_crit_section(&needput);
 	if (!unconfined(label))
 		error = aa_path_perm(op, current_cred(), label, path, 0, mask,
-				     cond);
+				     cond, NULL);
 	__end_current_label_crit_section(label, needput);
 
 	return error;
@@ -420,12 +430,12 @@ static int apparmor_path_rename(const struct path *old_dir, struct dentry *old_d
 					     label, &new_path, 0,
 					     MAY_READ | AA_MAY_GETATTR | MAY_WRITE |
 					     AA_MAY_SETATTR | AA_MAY_DELETE,
-					     &cond_exchange);
+					     &cond_exchange, NULL);
 			if (!error)
 				error = aa_path_perm(OP_RENAME_DEST, current_cred(),
 						     label, &old_path,
 						     0, MAY_WRITE | AA_MAY_SETATTR |
-						     AA_MAY_CREATE, &cond_exchange);
+						     AA_MAY_CREATE, &cond_exchange, NULL);
 		}
 
 		if (!error)
@@ -433,12 +443,12 @@ static int apparmor_path_rename(const struct path *old_dir, struct dentry *old_d
 					     label, &old_path, 0,
 					     MAY_READ | AA_MAY_GETATTR | MAY_WRITE |
 					     AA_MAY_SETATTR | AA_MAY_DELETE,
-					     &cond);
+					     &cond, NULL);
 		if (!error)
 			error = aa_path_perm(OP_RENAME_DEST, current_cred(),
 					     label, &new_path,
 					     0, MAY_WRITE | AA_MAY_SETATTR |
-					     AA_MAY_CREATE, &cond);
+					     AA_MAY_CREATE, &cond, NULL);
 
 	}
 	end_current_label_crit_section(label, needput);
@@ -456,9 +466,162 @@ static int apparmor_path_chown(const struct path *path, kuid_t uid, kgid_t gid)
 	return common_perm_cond(OP_CHOWN, path, AA_MAY_CHOWN);
 }
 
+static int common_mqueue_path_perm(const char *op, u32 request,
+				   const struct path *path)
+{
+	struct aa_label *label;
+	int error = 0;
+	bool needput;
+
+	label = begin_current_label_crit_section(&needput);
+	if (!unconfined(label))
+		error = aa_mqueue_perm(op, current_cred(), label, path,
+				       request);
+
+	end_current_label_crit_section(label, needput);
+
+	return error;
+}
+
 static int apparmor_inode_getattr(const struct path *path)
 {
+	if (is_mqueue_dentry(path->dentry))
+		/* TODO: fn() for d_parent */
+		return common_mqueue_path_perm(OP_GETATTR, AA_MAY_GETATTR, path);
+
 	return common_perm_cond(OP_GETATTR, path, AA_MAY_GETATTR);
+}
+
+/* inode security operations */
+
+/* alloced by infrastructure */
+static int apparmor_inode_alloc_security(struct inode *inode)
+{
+	struct aa_inode_sec *isec = apparmor_inode(inode);
+
+	spin_lock_init(&isec->lock);
+	isec->inode = inode;
+	isec->label = NULL;
+	isec->sclass = 0;
+	isec->initialized = false;
+
+	return 0;
+}
+
+/* freed by infrastructure */
+static void apparmor_inode_free_security(struct inode *inode)
+{
+	struct aa_inode_sec *isec = apparmor_inode(inode);
+
+	if (unlikely(!isec))
+		return;
+
+	aa_put_label(isec->label);
+}
+
+static int inode_init_with_dentry(struct inode *inode, struct dentry *dentry)
+{
+	struct aa_inode_sec *isec = apparmor_inode(inode);
+
+	if (isec->initialized)
+		return 0;
+	spin_lock(&isec->lock);
+	/* recheck under lock */
+	if (isec->initialized)
+		goto unlock;
+
+	if (is_mqueue_sb(inode->i_sb)) {
+		/* only initialize based on implied label atm */
+		isec->label = aa_get_current_label();
+		isec->sclass = AA_CLASS_POSIX_MQUEUE;
+		isec->initialized = true;
+	}
+
+unlock:
+	spin_unlock(&isec->lock);
+
+	return 0;
+}
+
+static int apparmor_inode_init_security(struct inode *inode, struct inode *dir,
+				       const struct qstr *qstr,
+				       struct xattr *xattrs, int *xattr_count)
+{
+	int error;
+
+	error = inode_init_with_dentry(inode, NULL);
+	if (error)
+		return error;
+
+	/* we aren't setting xattrs yet so -EOPNOTSUPP indicates
+	 * that, not an error
+	 */
+	return -EOPNOTSUPP;
+}
+
+static void apparmor_d_instantiate(struct dentry *dentry, struct inode *inode)
+{
+	if (inode)
+		inode_init_with_dentry(inode, dentry);
+}
+
+static int apparmor_inode_create(struct inode *dir, struct dentry *dentry,
+				 umode_t mode)
+{
+	struct aa_label *label;
+	int error = 0;
+	bool needput;
+
+	label = begin_current_label_crit_section(&needput);
+	if (!unconfined(label)) {
+		struct path path = {
+			.dentry = dentry,
+			.mnt = current->nsproxy->ipc_ns->mq_mnt,
+		};
+		if (is_mqueue_inode(dir))
+			error = aa_mqueue_perm(OP_CREATE, current_cred(),
+					       label, &path, AA_MAY_CREATE);
+	}
+	end_current_label_crit_section(label, needput);
+
+	return error;
+}
+
+static int common_mqueue_perm(const char *op, u32 request, struct inode *dir, struct dentry *dentry)
+{
+	/* can't directly determine ipc ns, but know for mqueues dir is mnt_root */
+	bool isdir = d_inode(current->nsproxy->ipc_ns->mq_mnt->mnt_root) == dir;
+	struct path path = {
+		.dentry = dentry,
+		.mnt = isdir ? current->nsproxy->ipc_ns->mq_mnt : NULL,
+	};
+
+	if (dir != d_inode(current->nsproxy->ipc_ns->mq_mnt->mnt_root))
+		pr_warn("apparmor: unlink dir != mnt_root - disconnected");
+
+	return common_mqueue_path_perm(op, request, &path);
+}
+
+static int apparmor_inode_unlink(struct inode *dir, struct dentry *dentry)
+{
+	int error = 0;
+
+	if (is_mqueue_dentry(dentry))
+		error = common_mqueue_perm(OP_UNLINK, AA_MAY_DELETE, dir, dentry);
+
+	return error;
+}
+
+static int apparmor_inode_setattr(struct mnt_idmap *idmap,
+				  struct dentry *dentry, struct iattr *iattr)
+{
+	/* TODO: extend to support iattr as a parameter */
+	if (is_mqueue_dentry(dentry))
+		/* TODO: fn() for d_parent */
+		return common_mqueue_perm(OP_SETATTR, AA_MAY_SETATTR,
+				  d_backing_inode(dentry->d_parent), dentry);
+
+	return 0;
 }
 
 static int apparmor_file_open(struct file *file)
@@ -488,17 +651,28 @@ static int apparmor_file_open(struct file *file)
 		struct mnt_idmap *idmap = file_mnt_idmap(file);
 		struct inode *inode = file_inode(file);
 		vfsuid_t vfsuid;
+		u32 allow;
 		struct path_cond cond = {
 			.mode = inode->i_mode,
 		};
 		vfsuid = i_uid_into_vfsuid(idmap, inode);
 		cond.uid = vfsuid_into_kuid(vfsuid);
 
-		error = aa_path_perm(OP_OPEN, file->f_cred,
-				     label, &file->f_path, 0,
-				     aa_map_file_to_perms(file), &cond);
-		/* todo cache full allowed permissions set and state */
-		fctx->allow = aa_map_file_to_perms(file);
+		if (is_mqueue_inode(file_inode(file))) {
+			error = aa_mqueue_perm(OP_OPEN, file->f_cred,
+					       label, &file->f_path,
+					       aa_map_file_to_perms(file));
+			allow = aa_map_file_to_perms(file);
+		} else {
+			/* will be intersected and reduced with each profile */
+			allow = ALL_PERMS_MASK;
+			error = aa_path_perm(OP_OPEN, file->f_cred,
+					     label, &file->f_path, 0,
+					     aa_map_file_to_perms(file), &cond,
+					     &allow);
+		}
+		if (!error)
+			fctx->allow = allow;
 	}
 	aa_put_label_condref(label, needput);
 
@@ -511,6 +685,7 @@ static int apparmor_file_alloc_security(struct file *file)
 	bool needput;
 	struct aa_label *label = begin_current_label_crit_section(&needput);
 
+	/* no inode available here */
 	spin_lock_init(&ctx->lock);
 	rcu_assign_pointer(ctx->label, aa_get_label(label));
 	end_current_label_crit_section(label, needput);
@@ -629,27 +804,50 @@ static int profile_uring(struct aa_profile *profile, u32 request,
 {
 	unsigned int state;
 	struct aa_ruleset *rules;
-	int error = 0;
 
 	AA_BUG(!profile);
 
 	rules = profile->label.rules[0];
+	/* TODO: rework unconfined profile/dfa to mediate user ns, then
+	 * we can drop the unconfined test
+	 */
 	state = RULE_MEDIATES(rules, AA_CLASS_IO_URING);
-	if (state) {
-		struct aa_perms perms = { };
-
-		if (new) {
-			aa_label_match(profile, rules, new, state,
-				       false, request, &perms);
+	if (!state) {
+		/* TODO: this gets replaced when the default unconfined
+		 * profile dfa gets updated to handle this
+		 */
+		if (profile_unconfined(profile) &&
+		    profile == profiles_ns(profile)->unconfined) {
+			if (!aa_unprivileged_uring_restricted ||
+			    ns_capable_noaudit(current_user_ns(), cap))
+				/* unconfined early bail out */
+				return 0;
+			/* unconfined unprivileged user */
+			/* don't just return: allow complain mode to override */
 		} else {
-			perms = *aa_lookup_perms(rules->policy, state);
+			/* Fallback to capability check if profile doesn't
+			 * support io_uring rules. Note: special unconfined
+			 * profiles as well.
+			 */
+			return aa_capable(current_cred(), &profile->label,
+					  cap, CAP_OPT_NONE);
 		}
-		aa_apply_modes_to_perms(profile, &perms);
-		error = aa_check_perms(profile, &perms, request, ad,
-				       audit_uring_cb);
+		/* continue to mediation - !state means non-accepting
+		 * but can be overidden by complain
+		 */
 	}
 
-	return error;
+	struct aa_perms perms = { };
+
+	if (new) {
+		aa_label_match(profile, rules, new, state, false, request,
+			       &perms);
+	} else {
+		perms = *aa_lookup_perms(rules->policy, state);
+	}
+	aa_apply_modes_to_perms(profile, &perms);
+
+	return aa_check_perms(profile, &perms, request, ad, audit_uring_cb);
 }
 
 /**
@@ -1047,22 +1245,33 @@ static int apparmor_task_kill(struct task_struct *target, struct kernel_siginfo 
 	return error;
 }
 
-static int apparmor_userns_create(const struct cred *cred)
+static int apparmor_userns_create(const struct cred *new_cred)
 {
 	struct aa_label *label;
 	struct aa_profile *profile;
 	int error = 0;
 	bool needput;
-	DEFINE_AUDIT_DATA(ad, LSM_AUDIT_DATA_TASK, AA_CLASS_NS,
-			  OP_USERNS_CREATE);
-
-	ad.subj_cred = current_cred();
 
 	label = begin_current_label_crit_section(&needput);
-	if (!unconfined(label)) {
-		error = fn_for_each(label, profile,
-				    aa_profile_ns_perm(profile, &ad,
-						       AA_USERNS_CREATE));
+	/* remove unprivileged_userns_restricted check when unconfined is updated */
+	if (aa_unprivileged_userns_restricted ||
+	    label_mediates(label, AA_CLASS_NS)) {
+		struct aa_label *new;
+		DEFINE_AUDIT_DATA(ad, LSM_AUDIT_DATA_TASK, AA_CLASS_NS,
+				  OP_USERNS_CREATE);
+		ad.subj_cred = current_cred();
+
+		new = fn_label_build(label, profile, GFP_KERNEL,
+				aa_profile_ns_perm(profile, &ad,
+						   AA_USERNS_CREATE));
+		if (IS_ERR(new)) {
+			error = PTR_ERR(new);
+		} else if (new && cred_label(new_cred) != new) {
+			aa_put_label(cred_label(new_cred));
+			set_cred_label(new_cred, new);
+		} else {
+			aa_put_label(new);
+		}
 	}
 	end_current_label_crit_section(label, needput);
 
@@ -1076,7 +1285,7 @@ static int apparmor_sk_alloc_security(struct sock *sk, int family, gfp_t gfp)
 	bool needput;
 
 	label = __begin_current_label_crit_section(&needput);
-	//spin_lock_init(&ctx->lock);
+	spin_lock_init(&ctx->lock);
 	rcu_assign_pointer(ctx->label, aa_get_label(label));
 	rcu_assign_pointer(ctx->peer, NULL);
 	rcu_assign_pointer(ctx->peer_lastupdate, NULL);
@@ -1653,6 +1862,83 @@ static void apparmor_sock_graft(struct sock *sk, struct socket *parent)
 }
 
 #ifdef CONFIG_NETWORK_SECMARK
+
+/* secmark reference count */
+static atomic_t apparmor_secmark_refcount = ATOMIC_INIT(0);
+
+
+/* count of rules using secmark that have been loaded into netfilter
+ * would be nice if it was per packet, or least per secid so we know which ids
+ * to pin
+ */
+static void apparmor_secmark_refcount_inc(void)
+{
+	atomic_inc(&apparmor_secmark_refcount);
+}
+
+/* rule using secmark has been removed from netfilter */
+static void apparmor_secmark_refcount_dec(void)
+{
+	atomic_dec(&apparmor_secmark_refcount);
+}
+
+static inline bool aa_secmark_enabled(void)
+{
+	return (aa_secmark() && aa_skb_packet_mediation);
+}
+
+static inline bool aa_mediates_secmark(struct aa_label *label)
+{
+	return aa_secmark_enabled() &&
+		(label_mediates(label, AA_CLASS_NETV9_SKB) ||
+		 atomic_read(&apparmor_secmark_refcount));
+}
+
+/* check if current process can use secmark to set a label on the packet
+ * only done in mangle or security tables
+ * @sid is the label that is going to be set
+ */
+static int apparmor_secmark_relabel_packet(u32 sid)
+{
+	if (!aa_secmark_enabled())
+		return 0;
+
+	return aa_secmark_relabel_packet(sid);
+}
+
+#endif /* CONFIG_NETWROK_SECMARK */
+
+static struct aa_label *refresh_sk_ctx(struct aa_sk_ctx *ctx)
+{
+	struct aa_label *new, *old;
+
+	/* update caching of label on sk_ctx */
+	spin_lock(&ctx->lock);
+	old = rcu_dereference_protected(ctx->label,
+					lockdep_is_held(&ctx->lock));
+	new = aa_get_newest_label(old);
+	rcu_assign_pointer(ctx->label, new);
+	spin_unlock(&ctx->lock);
+	aa_put_label(old);
+
+	return new;		/* no refcount, use only in rcu_read_lock */
+}
+
+/* must be called from within rcu_read_lock */
+static struct aa_label *__begin_sk_ctx_crit_section(struct aa_sk_ctx *ctx)
+{
+	struct aa_label *label;
+
+	label = rcu_dereference(ctx->label);
+	if (label_is_stale(label)) {
+		label = refresh_sk_ctx(ctx);
+	}
+
+	return label;
+}
+
+#define __end_sk_ctx_crit_section(label)	/* nop */
+
 /**
  * apparmor_socket_sock_rcv_skb - check perms before associating skb to sk
  * @sk: sk to associate @skb with
@@ -1666,9 +1952,12 @@ static void apparmor_sock_graft(struct sock *sk, struct socket *parent)
 static int apparmor_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	struct aa_sk_ctx *ctx = aa_sock(sk);
-	int error;
+	struct aa_label *label;
+	int error = 0;
 
-	if (!skb->secmark)
+	if (!aa_secmark_enabled())
+		return 0;
+	if (sk->sk_family != PF_INET && sk->sk_family != PF_INET6)
 		return 0;
 
 	/*
@@ -1679,75 +1968,220 @@ static int apparmor_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		return -EACCES;
 
 	rcu_read_lock();
-	error = apparmor_secmark_check(rcu_dereference(ctx->label), OP_RECVMSG,
-				       AA_MAY_RECEIVE, skb->secmark, sk);
+	label = __begin_sk_ctx_crit_section(ctx);
+	AA_DEBUG_LABEL(label, DEBUG_SKB, "ctx label %p %s, mediates %d secmark %d", label, label->hname ? label->hname : "<NULL>", label_mediates(label, AA_CLASS_NETV9_SKB), skb->secmark);
+
+	if (label_mediates(label, AA_CLASS_NETV9_SKB) || skb->secmark)
+		/* receive uses socket label as proxy
+		 * may do interface processing without SECMARK
+		 */
+		error = __aa_sock_rcv_skb(label, sk, skb);
+	/* else none of the profiles in label mediate skbs &&
+	 * the skb is unlabeled
+	 */
+	__end_sk_ctx_crit_section(label);
 	rcu_read_unlock();
 
 	return error;
 }
 
-static int apparmor_inet_conn_request(const struct sock *sk, struct sk_buff *skb,
+/* Accept an incoming connection request
+ */
+static int apparmor_inet_conn_request(const struct sock *sk,
+				      struct sk_buff *skb,
 				      struct request_sock *req)
 {
 	struct aa_sk_ctx *ctx = aa_sock(sk);
-	int error;
+	struct aa_label *label;
+	int error = 0;
 
-	if (!skb->secmark)
+	if (!aa_secmark_enabled())
 		return 0;
 
 	rcu_read_lock();
-	error = apparmor_secmark_check(rcu_dereference(ctx->label), OP_CONNECT,
-				       AA_MAY_CONNECT, skb->secmark, sk);
+	label = __begin_sk_ctx_crit_section(ctx);
+	AA_DEBUG_LABEL(label, DEBUG_SKB, "label_mediates %d, skb->secmark, %u", label_mediates(label, AA_CLASS_NETV9_SKB), skb->secmark);
+	if (label_mediates(label, AA_CLASS_NETV9_SKB) || skb->secmark)
+		/* receive uses socket label as proxy
+		 * may do interface processing without SECMARK
+		 */
+		error = __aa_inet_conn_request(label, sk, skb, req);
+	/* else none of the profiles in label mediate skbs &&
+	 * the skb is unlabeled
+	 */
+	__end_sk_ctx_crit_section(label);
 	rcu_read_unlock();
 
 	return error;
 }
-#endif
 
-#if defined(CONFIG_NETFILTER) && defined(CONFIG_NETWORK_SECMARK)
+
+#ifdef CONFIG_NETFILTER
+
 static unsigned int apparmor_ip_postroute(void *priv,
 					  struct sk_buff *skb,
 					  const struct nf_hook_state *state)
 {
 	struct aa_sk_ctx *ctx;
+	struct aa_label *label;
 	struct sock *sk;
-	int error;
+	int error = 0;
 
-	if (!skb->secmark)
+	/* we need the secmark for postroute mediation */
+	if (!aa_secmark_enabled() || !skb->secmark)
 		return NF_ACCEPT;
 
 	sk = skb_to_full_sk(skb);
-	if (sk == NULL)
-		return NF_ACCEPT;
+	if (sk == NULL) {
+		if (skb->skb_iif)
+			/* Forwarded packet, not handled atm */
+			return NF_ACCEPT;
+		/* kernel sending a packet - no need to look at secmark */
+		label = kernel_t;
+	} else if (sk_listener(sk)) {
+		/* locally generated SYN_ACK - regenerate below using ctx */
+	} else {
+		/* locally generated packet - look at skb and ctx below*/
+	}
 
 	ctx = aa_sock(sk);
 	rcu_read_lock();
-	error = apparmor_secmark_check(rcu_dereference(ctx->label), OP_SENDMSG,
-				       AA_MAY_SEND, skb->secmark, sk);
-	rcu_read_unlock();
-	if (!error)
-		return NF_ACCEPT;
+	label = __begin_sk_ctx_crit_section(ctx);
+	AA_DEBUG_LABEL(label, DEBUG_SKB, "ctx label %p %s", label, label && label->hname ? label->hname : "<null>");
 
-	return NF_DROP_ERR(-ECONNREFUSED);
+	if (label && label_mediates(label, AA_CLASS_NETV9_SKB))
+		error = __aa_ip_postroute(label, sk, skb, state);
+
+	if (error) {
+		AA_DEBUG_LABEL(label, DEBUG_SKB, "error %d", error);
+		error = NF_DROP_ERR(-ECONNREFUSED);
+	} else {
+		AA_DEBUG_LABEL(label, DEBUG_SKB, "accept %p %s", label, label && label->hname ? label->hname : "<null>");
+		error = NF_ACCEPT;
+	}
+
+	__end_sk_ctx_crit_section(label);
+	rcu_read_unlock();
+	return error;
 }
 
+
+static unsigned int apparmor_ip_localout(void *priv, struct sk_buff *skb,
+				       const struct nf_hook_state *state)
+{
+	struct aa_label *label, *out;
+	bool needput;
+
+	if (!aa_secmark_enabled())
+		return NF_ACCEPT;
+
+	label = __begin_current_label_crit_section(&needput);
+	if (!label_mediates(label, AA_CLASS_NETV9_SKB)) {
+		/* apparmor isn't going to do iface or packet based
+		 * filtering so bail.
+		 */
+		AA_DEBUG_LABEL(label, DEBUG_SKB, "label does not mediate skb");
+		__end_current_label_crit_section(label, needput);
+		return NF_ACCEPT;
+	}
+
+	struct sock *sk = skb_to_full_sk(skb);
+
+	if (sk) {
+		if (sk_listener(sk)) {
+			/* socket is in listening state, packet is a SYN-ACK
+			 * If using socket as proxy would need conn/request
+			 * socket, but only have parent.
+			 * However unless socket perms are delegated not
+			 * labeling based on socket but sending task
+			 */
+			if (aa_g_debug & DEBUG_SKB) {
+				rcu_read_lock();
+				struct aa_label *sklabel = aa_get_label(aa_sock(sk)->label);
+
+				rcu_read_unlock();
+				aa_put_label(sklabel);
+
+			}
+			AA_DEBUG_LABEL(label, DEBUG_SKB, "sk_listener");
+			return NF_ACCEPT;
+		}
+		/* TODO: support delegation via socket label instead of
+		 * task
+		 */
+		out = __aa_ip_localout(label, sk, skb);
+	} else {
+		out = kernel_t;
+	}
+	__end_current_label_crit_section(label, needput);
+
+	if (IS_ERR(out))
+		return NF_DROP_ERR(PTR_ERR(out));
+
+	if (!out)
+		/* all profiles decline to provide a label */
+		out = unlabeled_t;
+
+	/* put mark on packet */
+	aa_pin_secid(out);
+	skb->secmark = out->secid;
+	if (out != unlabeled_t && out != kernel_t)
+		aa_put_label(out);
+
+	return NF_ACCEPT;
+}
+
+/* HOOKS requiring NETFILTER, and may require SECMARK */
 static const struct nf_hook_ops apparmor_nf_ops[] = {
+	{
+		.hook =         apparmor_ip_localout,
+		.pf =           NFPROTO_IPV4,
+		.hooknum =      NF_INET_LOCAL_OUT,
+		.priority =     NF_IP_PRI_SELINUX_FIRST,
+	},
+#ifdef CONFIG_NETWORK_SECMARK
 	{
 		.hook =         apparmor_ip_postroute,
 		.pf =           NFPROTO_IPV4,
 		.hooknum =      NF_INET_POST_ROUTING,
 		.priority =     NF_IP_PRI_SELINUX_FIRST,
 	},
+	/* ip_forward goes here is apparmor ever supports it
+	 *{
+	 *	.hook =		apparmor_ip_forward,
+	 *	.pf =		NFPROTO_IPV4,
+	 *	.hooknum =	NF_INET_FORWARD,
+	 *	.priority =	NF_IP_PRI_SELINUX_FIRST,
+	 *},
+	 */
+#endif /* CONFIG_NETWORK_SECMARK */
+
 #if IS_ENABLED(CONFIG_IPV6)
+	{
+		.hook =         apparmor_ip_localout,
+		.pf =           NFPROTO_IPV6,
+		.hooknum =      NF_INET_LOCAL_OUT,
+		.priority =     NF_IP6_PRI_SELINUX_FIRST,
+	},
+#ifdef CONFIG_NETWORK_SECMARK
 	{
 		.hook =         apparmor_ip_postroute,
 		.pf =           NFPROTO_IPV6,
 		.hooknum =      NF_INET_POST_ROUTING,
 		.priority =     NF_IP6_PRI_SELINUX_FIRST,
 	},
-#endif
+	/* ip_forward goes here is apparmor ever supports it
+	 *{
+	 *	.hook =		apparmor_ip_forward,
+	 *	.pf =		NFPROTO_IPV6,
+	 *	.hooknum =	NF_INET_FORWARD,
+	 *	.priority =	NF_IP6_PRI_SELINUX_FIRST,
+	 *},
+	 */
+#endif /* CONFIG_NETWORK_SECMARK */
+#endif /* IS_ENABLED(CONFIG_IPV6) */
 };
-#endif
+#endif /* CONFIG_NETFILTER */
 
 /*
  * The cred blob is a pointer to, not an instance of, an aa_label.
@@ -1755,8 +2189,13 @@ static const struct nf_hook_ops apparmor_nf_ops[] = {
 struct lsm_blob_sizes apparmor_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct aa_label *),
 	.lbs_file = sizeof(struct aa_file_ctx),
+	.lbs_inode = sizeof(struct aa_inode_sec),
 	.lbs_task = sizeof(struct aa_task_ctx),
 	.lbs_sock = sizeof(struct aa_sk_ctx),
+	.lbs_secmark = true,
+	.lbs_ipc = sizeof(struct aa_ipc_sec),
+	.lbs_msg_msg = sizeof(struct aa_msg_sec),
+	.lbs_superblock = sizeof(struct aa_superblock_sec),
 };
 
 static const struct lsm_id apparmor_lsmid = {
@@ -1785,6 +2224,16 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(path_chmod, apparmor_path_chmod),
 	LSM_HOOK_INIT(path_chown, apparmor_path_chown),
 	LSM_HOOK_INIT(path_truncate, apparmor_path_truncate),
+	LSM_HOOK_INIT(inode_getattr, apparmor_inode_getattr),
+
+	LSM_HOOK_INIT(inode_alloc_security, apparmor_inode_alloc_security),
+	LSM_HOOK_INIT(inode_free_security, apparmor_inode_free_security),
+	LSM_HOOK_INIT(inode_init_security, apparmor_inode_init_security),
+	LSM_HOOK_INIT(d_instantiate, apparmor_d_instantiate),
+
+	LSM_HOOK_INIT(inode_create, apparmor_inode_create),
+	LSM_HOOK_INIT(inode_unlink, apparmor_inode_unlink),
+	LSM_HOOK_INIT(inode_setattr, apparmor_inode_setattr),
 	LSM_HOOK_INIT(inode_getattr, apparmor_inode_getattr),
 
 	LSM_HOOK_INIT(file_open, apparmor_file_open),
@@ -1823,17 +2272,18 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(socket_getsockopt, apparmor_socket_getsockopt),
 	LSM_HOOK_INIT(socket_setsockopt, apparmor_socket_setsockopt),
 	LSM_HOOK_INIT(socket_shutdown, apparmor_socket_shutdown),
-#ifdef CONFIG_NETWORK_SECMARK
 	LSM_HOOK_INIT(socket_sock_rcv_skb, apparmor_socket_sock_rcv_skb),
+#ifdef CONFIG_NETWORK_SECMARK
+	LSM_HOOK_INIT(secmark_relabel_packet, apparmor_secmark_relabel_packet),
+	LSM_HOOK_INIT(secmark_refcount_inc, apparmor_secmark_refcount_inc),
+	LSM_HOOK_INIT(secmark_refcount_dec, apparmor_secmark_refcount_dec),
 #endif
 	LSM_HOOK_INIT(socket_getpeersec_stream,
 		      apparmor_socket_getpeersec_stream),
 	LSM_HOOK_INIT(socket_getpeersec_dgram,
 		      apparmor_socket_getpeersec_dgram),
 	LSM_HOOK_INIT(sock_graft, apparmor_sock_graft),
-#ifdef CONFIG_NETWORK_SECMARK
 	LSM_HOOK_INIT(inet_conn_request, apparmor_inet_conn_request),
-#endif
 
 	LSM_HOOK_INIT(cred_alloc_blank, apparmor_cred_alloc_blank),
 	LSM_HOOK_INIT(cred_free, apparmor_cred_free),
@@ -2429,6 +2879,17 @@ static int apparmor_dointvec(const struct ctl_table *table, int write,
 	return proc_dointvec(table, write, buffer, lenp, ppos);
 }
 
+static int userns_restrict_dointvec(const struct ctl_table *table, int write,
+				    void *buffer, size_t *lenp, loff_t *ppos)
+{
+	if (!apparmor_enabled)
+		return -EINVAL;
+	if (write && !aa_current_policy_admin_capable(NULL))
+		return -EPERM;
+
+	return proc_dointvec(table, write, buffer, lenp, ppos);
+}
+
 static const struct ctl_table apparmor_sysctl_table[] = {
 #ifdef CONFIG_USER_NS
 	{
@@ -2446,9 +2907,53 @@ static const struct ctl_table apparmor_sysctl_table[] = {
 		.mode           = 0600,
 		.proc_handler   = apparmor_dointvec,
 	},
+#ifdef CONFIG_USER_NS
+	{
+		.procname       = "apparmor_restrict_unprivileged_userns",
+		.data           = &aa_unprivileged_userns_restricted,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = userns_restrict_dointvec,
+	},
+	{
+		.procname       = "apparmor_restrict_unprivileged_userns_force",
+		.data           = &aa_unprivileged_userns_restricted_force,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec,
+	},
+	{
+		.procname       = "apparmor_restrict_unprivileged_userns_complain",
+		.data           = &aa_unprivileged_userns_restricted_complain,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec,
+	},
+#endif /* CONFIG_USER_NS */
 	{
 		.procname       = "apparmor_restrict_unprivileged_unconfined",
 		.data           = &aa_unprivileged_unconfined_restricted,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = userns_restrict_dointvec,
+	},
+	{
+		.procname       = "apparmor_restrict_unprivileged_io_uring",
+		.data           = &aa_unprivileged_uring_restricted,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec,
+	},
+	{
+		.procname       = "apparmor_cache_timeout",
+		.data           = &aa_cache_timeout,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec,
+	},
+	{
+		.procname       = "apparmor_packet_mediation",
+		.data           = &aa_skb_packet_mediation,
 		.maxlen         = sizeof(int),
 		.mode           = 0600,
 		.proc_handler   = apparmor_dointvec,
@@ -2498,7 +3003,7 @@ static int __init apparmor_nf_ip_init(void)
 
 	return 0;
 }
-#endif
+#endif /* defined(CONFIG_NETFILTER) && defined(CONFIG_NETWORK_SECMARK) */
 
 static const char nulldfa_src[] __aligned(8) = {
 	#include "nulldfa.in"
@@ -2566,7 +3071,20 @@ static void __init aa_teardown_dfa_engine(void)
 
 static int __init apparmor_init(void)
 {
-	int error;
+	int error = -ENOMEM;
+
+	/* setup allocation caches */
+	aa_audit_slab = kmem_cache_create("apparmor_auditcache",
+					  sizeof(struct aa_audit_node),
+					  0, SLAB_PANIC, NULL);
+	/* redundant condition here but we are keeping it in case
+	 * we decide to drop SLAB_PANIC, as apparmor could still
+	 * function without this cache
+	 */
+	if (!aa_audit_slab) {
+		AA_ERROR("Unable to setup auditdata slab cache\n");
+		goto alloc_out;
+	}
 
 	error = aa_setup_dfa_engine();
 	if (error) {
@@ -2614,6 +3132,18 @@ static int __init apparmor_init(void)
 	else
 		aa_info_message("AppArmor initialized");
 
+	if (aa_secmark()) {
+		if (aa_skb_packet_mediation)
+			aa_info_message("AppArmor secmark mediation enabled");
+		else
+			aa_info_message("AppArmor secmark mediation reserved: ready to be enabled");
+	} else {
+#ifdef CONFIG_NETWORK_SECMARK
+		aa_info_message("AppArmor secmark mediation disabled - failed to register");
+#else
+		aa_info_message("AppArmor secmark mediation disabled by config");
+#endif /* CONFIG_NETWORK_SECMARK */
+	}
 	return error;
 
 buffers_out:
@@ -2621,6 +3151,7 @@ buffers_out:
 alloc_out:
 	aa_destroy_aafs();
 	aa_teardown_dfa_engine();
+	kmem_cache_destroy(aa_audit_slab);
 
 	apparmor_enabled = false;
 	return error;
@@ -2628,7 +3159,7 @@ alloc_out:
 
 DEFINE_LSM(apparmor) = {
 	.id = &apparmor_lsmid,
-	.flags = LSM_FLAG_LEGACY_MAJOR | LSM_FLAG_EXCLUSIVE,
+	.flags = LSM_FLAG_LEGACY_MAJOR,
 	.enabled = &apparmor_enabled,
 	.blobs = &apparmor_blob_sizes,
 	.init = apparmor_init,

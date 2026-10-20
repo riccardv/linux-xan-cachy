@@ -1,0 +1,49 @@
+Driver-related patches (dropped at every major release if they are not yet upstream):
+
+Ubuntu-specific features not supported anymore:
+
+7.1
+ - UBUNTU: SAUCE: import Huawei ES3000_V2 (2.1.0.23)
+ - UBUNTU: SAUCE: cdc-acm: Exclude Exar USB serial ports
+ - UBUNTU: SAUCE: riscv: mm: Force disable sv57
+ - UBUNTU: SAUCE: make ASYNCB_INITIALIZED available for the kernel
+ - UBUNTU: SAUCE: Microsemi PCIe expansion board DT entry.
+ - UBUNTU: SAUCE: riscv: sifive: fu740: cpu{1, 2, 3, 4} set compatible to sifive, u74-mc
+ - UBUNTU: SAUCE: md/raid0: Link to wiki with guidance on multi-zone RAID0 layout migration
+ - UBUNTU: SAUCE: md/raid0: Use kernel specific layout
+ - UBUNTU: SAUCE: Revert "scsi: libsas: allow async aborts"
+ - UBUNTU: SAUCE: cacheinfo: Check for null last-level cache info
+ - UBUNTU: SAUCE: (no-up) PCI: fix system hang issue of Marvell SATA host controller
+ - UBUNTU: SAUCE: (no-up) intel_ips: blacklist ASUSTek G60JX laptops
+ - UBUNTU: SAUCE: (no-up) arm64: gicv3: its: Increase FORCE_MAX_ZONEORDER for Cavium ThunderX
+ - UBUNTU: SAUCE: [nf,v2] netfilter: x_tables: don't rely on well-behaving userspace
+ - UBUNTU: SAUCE: x86/PCI: Export find_cap() to be used in early PCI code
+ - UBUNTU: SAUCE: x86/quirks: Add parameter to clear MSIs early on boot
+ - UBUNTU: SAUCE: x86/quirks: Scan all busses for early PCI quirks
+ - UBUNTU: SAUCE: kthread: Do not leave kthread_create() immediately upon SIGKILL.
+
+7.2:
+ - UBUNTU: SAUCE: ACPI: scan: Update HID for new platform
+ - UBUNTU: SAUCE: media: platform: amd: Add isp4 fw and hw interface
+ - UBUNTU: SAUCE: media: platform: amd: isp4 video node and buffers handling added
+ - UBUNTU: SAUCE: (no-up) x86: reboot: Make Dell Optiplex 390 use reboot=pci
+ - UBUNTU: SAUCE: (no-up) x86: reboot: Make Dell Latitude E6220 use reboot=pci
+ - UBUNTU: SAUCE: (no-up) x86: reboot: Make Dell Optiplex 990 use reboot=pci
+ - UBUNTU: SAUCE: (no-up) x86: reboot: Make Dell Optiplex 790 use reboot=pci
+ - UBUNTU: SAUCE: (no-up) x86: reboot: Make Dell Latitude E6520 use reboot=pci
+
+7.3:
+ - UBUNTU: SAUCE: apparmor5.1.0 [1-61/61] (the whole apparmor 5.1.0 SAUCE series)
+ - UBUNTU: [Config] Enable SECURITY_APPARMOR_COMPRESSED_POLICY
+ - UBUNTU: [Config] enable/disable SECURITY_APPARMOR_PACKET_MEDIATION_ENABLED
+ - UBUNTU: SAUCE: arm64: dts: qcom: sc8280xp: Add Venus
+ - UBUNTU: SAUCE: arm64: dts: qcom: sc8280xp-x13s: Enable Venus
+ - UBUNTU: SAUCE: media: ipu-bridge: Support imx471 sensor
+ - UBUNTU: SAUCE: media: ipu-bridge: add TBE20A0 ACPI id for Sony IMX471
+ - UBUNTU: SAUCE: ceph: move mdsmap.h to fs/ceph/
+ - UBUNTU: SAUCE: Revert "rfkill: make new event layout opt-in"
+ - UBUNTU: SAUCE: ACPICA: avoid accessing operands out-of-bounds
+ - UBUNTU: SAUCE: Revert "net/tls(TLS_SW): Add selftest for 'chunked' sendfile test"
+ - UBUNTU: SAUCE: net: ena: fix too long default tx interrupt moderation interval
+ - UBUNTU: SAUCE: (lockdown) security: use default hook return value
+ - UBUNTU: SAUCE: (no-up) Input: Cypress PS/2 Trackpad simulated multitouch

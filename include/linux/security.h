@@ -2439,4 +2439,13 @@ static inline void security_initramfs_populated(void)
 }
 #endif /* CONFIG_SECURITY */
 
+#ifdef CONFIG_SECURITY_LOCKDOWN_LSM
+extern int security_lock_kernel_down(const char *where, enum lockdown_reason level);
+#else
+static inline int security_lock_kernel_down(const char *where, enum lockdown_reason level)
+{
+	return 0;
+}
+#endif /* CONFIG_SECURITY_LOCKDOWN_LSM */
+
 #endif /* ! __LINUX_SECURITY_H */

@@ -18,11 +18,16 @@
 
 extern struct aa_dfa *stacksplitdfa;
 
+#define list_add_entry(ent, list, member) list_add(&(ent)->member, (list))
+#define list_add_tail_entry(ent, list, member) list_add_tail(&(ent)->member, (list))
+
 /*
  * split individual debug cases out in preparation for finer grained
  * debug controls in the future.
  */
 #define dbg_printk(__fmt, __args...) pr_debug(__fmt, ##__args)
+
+#define DEBUG_PROMPT 2
 
 #define DEBUG_NONE 0
 #define DEBUG_LABEL_ABS_ROOT 1
@@ -32,8 +37,10 @@ extern struct aa_dfa *stacksplitdfa;
 #define DEBUG_INTERFACE 0x10
 #define DEBUG_UNPACK 0x20
 #define DEBUG_TAGS 0x40
+#define DEBUG_UPCALL 0x80
+#define DEBUG_SKB 0x100
 
-#define DEBUG_ALL 0x7f		/* update if new DEBUG_X added */
+#define DEBUG_ALL 0x1ff		/* update if new DEBUG_X added */
 #define DEBUG_PARSE_ERROR (-1)
 
 #define DEBUG_ON (aa_g_debug != DEBUG_NONE)
@@ -42,8 +49,9 @@ extern struct aa_dfa *stacksplitdfa;
 #define AA_DEBUG(opt, fmt, args...)					\
 	do {								\
 		if (aa_g_debug & opt)					\
-			pr_warn_ratelimited("%s: " fmt, __func__, ##args); \
+			pr_warn("%s: " fmt, __func__, ##args); \
 	} while (0)
+#define AA_DEBUG_ON(C, args...) do { if (C) AA_DEBUG(args); } while (0)
 #define AA_DEBUG_LABEL(LAB, X, fmt, args...)				\
 do {									\
 	if ((LAB)->flags & FLAG_DEBUG1)					\
@@ -141,6 +149,14 @@ static inline aa_state_t aa_dfa_null_transition(const struct aa_dfa *dfa,
 {
 	/* the null transition only needs the string's null terminator byte */
 	return aa_dfa_next(dfa, start, 0);
+}
+
+static inline aa_state_t aa_dfa_match_u16(const struct aa_dfa *dfa,
+					  aa_state_t state, u16 data)
+{
+	__be16 buffer = cpu_to_be16(data);
+
+	return aa_dfa_match_len(dfa, state, (char *) &buffer, 2);
 }
 
 static inline bool path_mediated_fs(struct dentry *dentry)
@@ -359,5 +375,8 @@ __done:									\
 	fn_label_build((L), (P), (GFP),					\
 		__fn_build_in_scope(labels_ns(L), (P), (NS_FN), (OTHER_FN))); \
 })
+
+#define fn_label_build_in_netns_scope(L, P, GFP, FN)	\
+	fn_label_build((L), (P), (GFP), (FN))
 
 #endif /* __AA_LIB_H */

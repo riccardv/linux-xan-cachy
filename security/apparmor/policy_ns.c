@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <uapi/linux/apparmor.h>
 
 #include "include/apparmor.h"
 #include "include/cred.h"
@@ -24,6 +25,7 @@
 
 /* kernel label */
 struct aa_label *kernel_t;
+struct aa_label *unlabeled_t;
 
 /* root profile namespace */
 struct aa_ns *root_ns;
@@ -117,6 +119,8 @@ static struct aa_ns *alloc_ns(const char *prefix, const char *name)
 	INIT_LIST_HEAD(&ns->rawdata_list);
 	mutex_init(&ns->lock);
 	init_waitqueue_head(&ns->wait);
+	spin_lock_init(&ns->listener_lock);
+	INIT_LIST_HEAD(&ns->listeners);
 
 	/* released by aa_free_ns() */
 	ns->unconfined = alloc_unconfined("unconfined");
@@ -372,15 +376,25 @@ int __init aa_alloc_root_ns(void)
 		return -ENOMEM;
 
 	kernel_p = alloc_unconfined("kernel_t");
-	if (!kernel_p) {
-		destroy_ns(root_ns);
-		aa_free_ns(root_ns);
-		return -ENOMEM;
-	}
+	if (!kernel_p)
+		goto fail;
 	kernel_t = &kernel_p->label;
+
+	kernel_p = alloc_unconfined("unlabeled_t");
+	if (!kernel_p)
+		goto fail;
+	unlabeled_t = &kernel_p->label;
+
 	root_ns->unconfined->ns = aa_get_ns(root_ns);
 
+
 	return 0;
+fail:
+	aa_put_label(kernel_t);
+	aa_put_label(unlabeled_t);
+	destroy_ns(root_ns);
+	aa_free_ns(root_ns);
+	return -ENOMEM;
 }
 
  /**

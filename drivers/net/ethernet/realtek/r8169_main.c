@@ -15,6 +15,7 @@
 #include <linux/etherdevice.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/dmi.h>
 #include <linux/ethtool.h>
 #include <linux/phy.h>
 #include <linux/if_vlan.h>
@@ -1273,6 +1274,34 @@ static int r8168g_mdio_read(struct rtl8169_private *tp, int reg)
 	return r8168_phy_ocp_read(tp, tp->ocp_base + reg * 2);
 }
 
+/* The quirk reflects RTL8116af SerDes status. */
+static int r8116af_mdio_read_quirk(struct rtl8169_private *tp, int reg)
+{
+	u8 phyStatus = RTL_R8(tp, PHYstatus);
+
+	if (!(phyStatus & LinkStatus))
+		return 0;
+
+	/* BMSR */
+	if (tp->ocp_base == OCP_STD_PHY_BASE && reg == MII_BMSR)
+		return BMSR_ANEGCOMPLETE | BMSR_LSTATUS;
+
+	/* PHYSR */
+	if (tp->ocp_base == 0xa430 && reg == 0x12)
+	{	if (phyStatus & _1000bpsF)
+			return 0x0028;
+		else if (phyStatus & _100bps)
+			return 0x0018;
+	}
+
+	return 0;
+}
+
+static int r8116af_mdio_read(struct rtl8169_private *tp, int reg)
+{
+	return r8168g_mdio_read(tp, reg) | r8116af_mdio_read_quirk(tp, reg);
+}
+
 static void mac_mcu_write(struct rtl8169_private *tp, int reg, int value)
 {
 	if (reg == 0x1f) {
@@ -1366,6 +1395,13 @@ static int r8168dp_2_mdio_read(struct rtl8169_private *tp, int reg)
 	return value;
 }
 
+static bool rtl_is_8116af(struct rtl8169_private *tp)
+{
+	return tp->mac_version == RTL_GIGA_MAC_VER_52 &&
+		(r8168_mac_ocp_read(tp, 0xdc00) & 0x0078) == 0x0030 &&
+		(r8168_mac_ocp_read(tp, 0xd006) & 0x00ff) == 0x0000;
+}
+
 static void rtl_writephy(struct rtl8169_private *tp, int location, int val)
 {
 	switch (tp->mac_version) {
@@ -1389,7 +1425,10 @@ static int rtl_readphy(struct rtl8169_private *tp, int location)
 	case RTL_GIGA_MAC_VER_31:
 		return r8168dp_2_mdio_read(tp, location);
 	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_LAST:
-		return r8168g_mdio_read(tp, location);
+		if (rtl_is_8116af(tp))
+			return r8116af_mdio_read(tp, location);
+		else
+			return r8168g_mdio_read(tp, location);
 	default:
 		return r8169_mdio_read(tp, location);
 	}
@@ -5595,11 +5634,44 @@ done:
 	rtl_rar_set(tp, mac_addr);
 }
 
+static bool rtl_aspm_new_dell_platforms(void)
+{
+	const char *family = dmi_get_system_info(DMI_PRODUCT_FAMILY);
+	static const char * const dell_product_families[] = {
+		"Alienware",
+		"Dell Laptops",
+		"Dell Pro Laptops",
+		"Dell Pro Max Laptops",
+		"Dell Desktops",
+		"Dell Pro Desktops",
+		"Dell Pro Max Desktops",
+		"Dell Pro Rugged Laptops",
+		"Dell Pro Precision",
+		"Dell Pro Essential",
+		"Dell Pro Education",
+		"XPS"
+	};
+	int i;
+
+	if (!family)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(dell_product_families); i++) {
+		if (str_has_prefix(family, dell_product_families[i]))
+			return true;
+	}
+
+	return false;
+}
+
 /* register is set if system vendor successfully tested ASPM 1.2 */
 static bool rtl_aspm_is_safe(struct rtl8169_private *tp)
 {
 	if (tp->mac_version >= RTL_GIGA_MAC_VER_46 &&
 	    r8168_mac_ocp_read(tp, 0xc0b2) & 0xf)
+		return true;
+
+	if (rtl_aspm_new_dell_platforms())
 		return true;
 
 	return false;

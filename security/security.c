@@ -514,6 +514,7 @@ int security_binder_set_context_mgr(const struct cred *mgr)
 {
 	return call_int_hook(binder_set_context_mgr, mgr);
 }
+EXPORT_SYMBOL(security_binder_set_context_mgr);
 
 /**
  * security_binder_transaction() - Check if a binder transaction is allowed
@@ -529,6 +530,7 @@ int security_binder_transaction(const struct cred *from,
 {
 	return call_int_hook(binder_transaction, from, to);
 }
+EXPORT_SYMBOL(security_binder_transaction);
 
 /**
  * security_binder_transfer_binder() - Check if a binder transfer is allowed
@@ -544,6 +546,7 @@ int security_binder_transfer_binder(const struct cred *from,
 {
 	return call_int_hook(binder_transfer_binder, from, to);
 }
+EXPORT_SYMBOL(security_binder_transfer_binder);
 
 /**
  * security_binder_transfer_file() - Check if a binder file xfer is allowed
@@ -560,6 +563,7 @@ int security_binder_transfer_file(const struct cred *from,
 {
 	return call_int_hook(binder_transfer_file, from, to, file);
 }
+EXPORT_SYMBOL(security_binder_transfer_file);
 
 /**
  * security_ptrace_access_check() - Check if tracing is allowed
@@ -3976,8 +3980,13 @@ EXPORT_SYMBOL(security_lsmprop_to_secctx);
  */
 int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid)
 {
+	struct lsm_static_call *scall;
+
 	*secid = 0;
-	return call_int_hook(secctx_to_secid, secdata, seclen, secid);
+	lsm_for_each_hook(scall, secctx_to_secid) {
+		return scall->hl->hook.secctx_to_secid(secdata, seclen, secid);
+	}
+	return LSM_RET_DEFAULT(secctx_to_secid);
 }
 EXPORT_SYMBOL(security_secctx_to_secid);
 
@@ -4438,8 +4447,13 @@ EXPORT_SYMBOL(security_sock_rcv_skb);
 int security_socket_getpeersec_stream(struct socket *sock, sockptr_t optval,
 				      sockptr_t optlen, unsigned int len)
 {
-	return call_int_hook(socket_getpeersec_stream, sock, optval, optlen,
-			     len);
+	struct lsm_static_call *scall;
+
+	lsm_for_each_hook(scall, socket_getpeersec_stream) {
+		return scall->hl->hook.socket_getpeersec_stream(sock, optval,
+							       optlen, len);
+	}
+	return LSM_RET_DEFAULT(socket_getpeersec_stream);
 }
 
 /**
@@ -4459,7 +4473,13 @@ int security_socket_getpeersec_stream(struct socket *sock, sockptr_t optval,
 int security_socket_getpeersec_dgram(struct socket *sock,
 				     struct sk_buff *skb, u32 *secid)
 {
-	return call_int_hook(socket_getpeersec_dgram, sock, skb, secid);
+	struct lsm_static_call *scall;
+
+	lsm_for_each_hook(scall, socket_getpeersec_dgram) {
+		return scall->hl->hook.socket_getpeersec_dgram(sock, skb,
+							     secid);
+	}
+	return LSM_RET_DEFAULT(socket_getpeersec_dgram);
 }
 EXPORT_SYMBOL(security_socket_getpeersec_dgram);
 
