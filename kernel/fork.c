@@ -132,12 +132,6 @@ extern int unprivileged_userns_clone;
 
 #include <kunit/visibility.h>
 
-#ifdef CONFIG_USER_NS
-static int unprivileged_userns_clone = 1;
-#else
-#define unprivileged_userns_clone 1
-#endif
-
 /*
  * Minimum number of threads to boot the kernel
  */
