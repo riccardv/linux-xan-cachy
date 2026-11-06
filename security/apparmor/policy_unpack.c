@@ -288,6 +288,19 @@ fail:
 	return false;
 }
 
+VISIBLE_IF_KUNIT bool unpack_u16(struct aa_ext *e, u16 *data, const char *name)
+{
+	if (aa_unpack_nameX(e, AA_U16, name)) {
+		if (!aa_inbounds(e, sizeof(u16)))
+			return 0;
+		if (data)
+			*data = le16_to_cpu(get_unaligned((__le16 *) e->pos));
+		e->pos += sizeof(u16);
+		return 1;
+	}
+	return 0;
+}
+
 VISIBLE_IF_KUNIT bool aa_unpack_u32(struct aa_ext *e, u32 *data, const char *name)
 {
 	void *pos = e->pos;
@@ -1118,9 +1131,10 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 	struct aa_profile *profile = NULL;
 	const char *tmpname, *tmpns = NULL, *name = NULL;
 	const char *info = "failed to unpack profile";
+	u16 size = 0;
 	size_t ns_len;
 	struct rhashtable_params params = { 0 };
-	char *key = NULL, *disconnected = NULL;
+	char *key = NULL, *disconnected = NULL, *disconnected_ipc = NULL;
 	struct aa_data *data;
 	int error = -EPROTO;
 	kernel_cap_t tmpcap;
@@ -1193,6 +1207,12 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 	(void) aa_unpack_strdup(e, &disconnected, "disconnected");
 	profile->disconnected = disconnected;
 
+	/* disconnected attachment for ipc string is optional
+	 * but it fallbacks to the plain disconnected if not present
+	 */
+	(void) aa_unpack_strdup(e, &disconnected_ipc, "disconnected_ipc");
+	profile->disconnected_ipc = disconnected_ipc ? disconnected_ipc : disconnected;
+
 	/* optional */
 	(void) aa_unpack_u32(e, &profile->signal, "kill");
 	if (profile->signal < 1 || profile->signal > MAXMAPPED_SIG) {
@@ -1213,6 +1233,8 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 		profile->label.flags |= FLAG_DEBUG1;
 	if (tmp & PACKED_FLAG_DEBUG2)
 		profile->label.flags |= FLAG_DEBUG2;
+	if (tmp & PACKED_FLAG_INTERRUPTIBLE)
+		profile->label.flags |= FLAG_INTERRUPTIBLE;
 	if (!aa_unpack_u32(e, &tmp, NULL))
 		goto fail;
 	if (tmp == PACKED_MODE_COMPLAIN || (e->version & FORCE_COMPLAIN_FLAG)) {
@@ -1294,6 +1316,45 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 	if (!unpack_secmark(e, rules)) {
 		info = "failed to unpack profile secmark rules";
 		goto fail;
+	}
+
+	if (aa_unpack_array(e, "net_allowed_af", &size) ||
+	    VERSION_LT(e->version, v8)) {
+		u16 i;
+
+		profile->net_compat = kzalloc(sizeof(struct aa_net_compat),
+					      GFP_KERNEL);
+		if (!profile->net_compat) {
+			info = "out of memory";
+			goto fail;
+		}
+		for (i = 0; i < size; i++) {
+			/* discard extraneous rules that this kernel will
+			 * never request
+			 */
+			if (i >= AF_MAX) {
+				u16 tmp;
+
+				if (!unpack_u16(e, &tmp, NULL) ||
+				    !unpack_u16(e, &tmp, NULL) ||
+				    !unpack_u16(e, &tmp, NULL))
+					goto fail;
+				continue;
+			}
+			if (!unpack_u16(e, &profile->net_compat->allow[i], NULL))
+				goto fail;
+			if (!unpack_u16(e, &profile->net_compat->audit[i], NULL))
+				goto fail;
+			if (!unpack_u16(e, &profile->net_compat->quiet[i], NULL))
+				goto fail;
+		}
+		if (size && !aa_unpack_nameX(e, AA_ARRAYEND, NULL))
+			goto fail;
+		if (VERSION_LT(e->version, v7)) {
+			/* pre v7 policy always allowed these */
+			profile->net_compat->allow[AF_UNIX] = 0xffff;
+			profile->net_compat->allow[AF_NETLINK] = 0xffff;
+		}
 	}
 
 	if (aa_unpack_nameX(e, AA_STRUCT, "policydb")) {

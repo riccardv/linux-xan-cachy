@@ -33,7 +33,12 @@
 struct aa_ns;
 
 extern int unprivileged_userns_apparmor_policy;
+extern int aa_unprivileged_userns_restricted;
+extern int aa_unprivileged_userns_restricted_force;
+extern int aa_unprivileged_userns_restricted_complain;
 extern int aa_unprivileged_unconfined_restricted;
+extern int aa_unprivileged_uring_restricted;
+extern int aa_skb_packet_mediation;
 
 extern const char *const aa_profile_mode_names[];
 
@@ -201,6 +206,9 @@ struct aa_ruleset {
 	struct aa_secmark *secmark;
 };
 
+void aa_free_ruleset(struct aa_ruleset *rules);
+struct aa_ruleset *aa_new_ruleset(gfp_t gfp);
+struct aa_ruleset *aa_clone_ruleset(struct aa_ruleset *rules, gfp_t gfp);
 
 /* struct aa_attachment - data and rules for a profiles attachment
  * @list:
@@ -231,6 +239,7 @@ struct aa_attachment {
  * @disconnected: what to prepend if attach_disconnected is specified
  * @attach: attachment rules for the profile
  * @rules: rules to be enforced
+ * @net_compat: v2 compat network controls for the profile
  *
  * learning_cache: the accesses learned in complain mode
  * raw_data: rawdata of the loaded profile policy
@@ -266,8 +275,12 @@ struct aa_profile {
 	u32 path_flags;
 	int signal;
 	const char *disconnected;
+	const char *disconnected_ipc;
 
 	struct aa_attachment attach;
+	struct aa_net_compat *net_compat;
+
+	struct aa_audit_cache learning_cache;
 
 	struct aa_loaddata *rawdata;
 	unsigned char *hash;
@@ -359,7 +372,19 @@ static inline aa_state_t RULE_MEDIATES_NET(struct aa_ruleset *rules)
 
 static inline aa_state_t RULE_MEDIATES_UNIX(struct aa_ruleset *rules)
 {
-	return RULE_MEDIATES_v9NET(rules);
+	/* can not use RULE_MEDIATE_v9AF here, because AF match fail
+	 * can not be distiguished from class match fail, and we only
+	 * fallback to checking older class on class match failure
+	 */
+	aa_state_t state = RULE_MEDIATES(rules, AA_CLASS_NETV9);
+
+	/* fallback and check v7/8 if v9 is NOT mediated */
+	if (!state) {
+		state = RULE_MEDIATES(rules, AA_CLASS_NET);
+		if (!state)
+			state = RULE_MEDIATES(rules, AA_CLASS_NET_COMPAT);
+	}
+	return state;
 }
 
 
