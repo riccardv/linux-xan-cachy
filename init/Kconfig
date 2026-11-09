@@ -1529,19 +1529,6 @@ config SCHED_AUTOGROUP
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
 
-config SCHED_POC_SELECTOR
-	bool "Piece-Of-Cake Fast Idle CPU Selector"
-	depends on SMP
-	default y
-	help
-	  Idle CPU selector using cached bitmasks inspired by the scx_cake BPF
-	  scheduler. Reduces select_idle_cpu overhead by using bitmap scanning.
-
-	  This optimization does not affect scheduler fairness - it only
-	  speeds up the process of finding an idle CPU for task wakeup.
-
-	  If unsure, say Y.
-
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"
 	select IRQ_WORK
@@ -2305,7 +2292,7 @@ config RUST
 	depends on !MODVERSIONS || GENDWARFKSYMS
 	depends on !GCC_PLUGIN_RANDSTRUCT
 	depends on !RANDSTRUCT
-	depends on !DEBUG_INFO_BTF || (PAHOLE_HAS_LANG_EXCLUDE && !LTO)
+	depends on !DEBUG_INFO_BTF || PAHOLE_HAS_LANG_EXCLUDE
 	depends on !CFI || HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC
 	select CFI_ICALL_NORMALIZE_INTEGERS if CFI
 	depends on !KASAN || CC_IS_CLANG
