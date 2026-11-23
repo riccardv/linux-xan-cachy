@@ -2672,6 +2672,7 @@ void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		if (fan_has_map(&vxlan->fan) && rt->rt_flags & RTCF_LOCAL) {
 			netdev_dbg(dev, "discard fan to localhost %pI4\n",
 				   &rdst->remote_ip.sin.sin_addr.s_addr);
+			rcu_read_unlock();
 			ip_rt_put(rt);
 			goto tx_free;
 		}
@@ -2980,7 +2981,7 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
 		netdev_dbg(vxlan->dev, "vxlan_xmit p %x d %pM\n",
 			   eth->h_proto, eth->h_dest);
 		if (vxlan_fan_build_rdst(vxlan, skb, &fan_rdst)) {
-			dev->stats.tx_dropped++;
+			dev_core_stats_tx_dropped_inc(dev);
 			kfree_skb(skb);
 			return NETDEV_TX_OK;
 		}

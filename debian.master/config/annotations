@@ -6054,7 +6054,7 @@ CONFIG_HAVE_DYNAMIC_FTRACE_WITH_JMP             policy<{'amd64': 'y'}>
 CONFIG_HAVE_DYNAMIC_FTRACE_WITH_REGS            policy<{'amd64': 'y', 'arm64': '-', 'armhf': 'y', 'ppc64el': 'y', 'riscv64': '-', 's390x': 'y'}>
 CONFIG_HAVE_EBPF_JIT                            policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y', 'ppc64el': 'y', 'riscv64': 'y', 's390x': 'y'}>
 CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS          policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y', 'ppc64el': 'y', 's390x': 'y'}>
-CONFIG_HAVE_EXIT_THREAD                         policy<{'amd64': 'y', 'armhf': 'y'}>
+CONFIG_HAVE_EXIT_THREAD                         policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y'}>
 CONFIG_HAVE_EXTRA_IPI_TRACEPOINTS               policy<{'arm64': 'y', 'armhf': 'y'}>
 CONFIG_HAVE_FENTRY                              policy<{'amd64': 'y', 's390x': 'y'}>
 CONFIG_HAVE_FTRACE_GRAPH_FUNC                   policy<{'amd64': 'y', 'arm64': 'y', 'ppc64el': 'y', 'riscv64': 'y', 's390x': 'y'}>
@@ -7154,7 +7154,7 @@ CONFIG_INTEL_SOC_PMIC_CHTWC                     policy<{'amd64': 'y'}>
 CONFIG_INTEL_SOC_PMIC_MRFLD                     policy<{'amd64': 'm'}>
 CONFIG_INTEL_SPEED_SELECT_INTERFACE             policy<{'amd64': 'm'}>
 CONFIG_INTEL_SPEED_SELECT_TPMI                  policy<{'amd64': 'm'}>
-CONFIG_INTEL_SSEI                               policy<{'amd64': 'm', 'arm64': 'm', 'armhf': 'm', 'ppc64el': 'm', 'riscv64': 'm', 's390x': 'n'}>
+CONFIG_INTEL_SSEI                               policy<{'amd64': 'm', 'arm64': '-', 'armhf': '-', 'ppc64el': '-', 'riscv64': '-', 's390x': '-'}>
 CONFIG_INTEL_SSEI_HW_HECI                       policy<{'amd64': 'm'}>
 CONFIG_INTEL_STRATIX10_RSU                      policy<{'arm64': 'm'}>
 CONFIG_INTEL_STRATIX10_SERVICE                  policy<{'arm64': 'm'}>
@@ -12511,7 +12511,6 @@ CONFIG_SATA_AHCI_SEATTLE                        policy<{'arm64': 'm'}>
 CONFIG_SATA_DWC                                 policy<{'amd64': 'm', 'arm64': 'm', 'armhf': 'm', 'ppc64el': 'm', 'riscv64': 'm', 's390x': '-'}>
 CONFIG_SATA_DWC_OLD_DMA                         policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y', 'ppc64el': 'y', 'riscv64': 'y'}>
 CONFIG_SATA_HOST                                policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y', 'ppc64el': 'y', 'riscv64': 'y'}>
-CONFIG_SATA_INIC162X                            policy<{'amd64': 'm', 'arm64': 'm', 'armhf': 'm', 'ppc64el': 'm', 'riscv64': 'm', 's390x': '-'}>
 CONFIG_SATA_MOBILE_LPM_POLICY                   policy<{'amd64': '3', 'arm64': '3', 'armhf': '3', 'ppc64el': '3', 'riscv64': '3'}>
 CONFIG_SATA_MV                                  policy<{'amd64': 'm', 'arm64': 'm', 'armhf': 'm', 'ppc64el': 'm', 'riscv64': 'm', 's390x': '-'}>
 CONFIG_SATA_NV                                  policy<{'amd64': 'm', 'arm64': 'm', 'armhf': 'm', 'ppc64el': 'm', 'riscv64': 'm', 's390x': '-'}>

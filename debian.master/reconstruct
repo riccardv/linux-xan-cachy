@@ -29,4 +29,5 @@ chmod +x 'debian/templates/image.postrm.in'
 chmod +x 'debian/templates/image.preinst.in'
 chmod +x 'debian/templates/image.prerm.in'
 # Remove any files deleted from the orig.
+rm -f 'drivers/ata/sata_inic162x.c'
 exit 0
