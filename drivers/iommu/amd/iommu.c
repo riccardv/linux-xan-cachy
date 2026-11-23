@@ -2760,8 +2760,6 @@ static void amd_iommu_release_device(struct device *dev)
 	 */
 }
 
-=======
->>>>>>> Ubuntu-7.3.0-12.13
 static struct iommu_group *amd_iommu_device_group(struct device *dev)
 {
 	if (dev_is_pci(dev))

@@ -25,6 +25,7 @@ struct aa_sfs_entry aa_sfs_entry_network[] = {
 	AA_SFS_FILE_STRING("af_mask",	AA_SFS_AF_MASK),
 	AA_SFS_FILE_BOOLEAN("af_inet",	1),
 	AA_SFS_FILE_BOOLEAN("tcp-fast-open",		1),
+	AA_SFS_FILE_BOOLEAN("sctp",		1),
 	{ }
 };
 
@@ -317,7 +318,7 @@ static int profile_af_perm(struct aa_profile *profile,
 					 type, protocol, &p, &ad->info);
 		return aa_do_perms(profile, rules->policy, state, request, p,
 				   ad);
-	} /* else */
+	} /* else - not mediated this covers the profile_unconfined() case */
 
 	return aa_profile_af_compat_perm(profile, ad, request, family, type);
 }
